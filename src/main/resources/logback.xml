@@ -1,0 +1,37 @@
+<configuration>
+    <appender name="rolling-info" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+            <level>INFO</level>
+        </filter>
+        <file>info.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>info-%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <!-- max size per file, max days history,  -->
+            <maxFileSize>20MB</maxFileSize>
+            <maxHistory>200</maxHistory>
+            <totalSizeCap>200MB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <charset>UTF-8</charset>
+            <pattern>%d{yy-MM-dd HH:mm:ss.SSS, UTC} Z [%thread] %-5level %logger{35} - %msg%n</pattern>
+        </encoder>
+    </appender>
+    <appender name="rolling-debug" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>debug.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>debug-%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <!-- max size per file, max days history,  -->
+            <maxFileSize>20MB</maxFileSize>
+            <maxHistory>200</maxHistory>
+            <totalSizeCap>200MB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <charset>UTF-8</charset>
+            <pattern>%d{yy-MM-dd HH:mm:ss.SSS, UTC} Z [%thread] %-5level %logger{35} - %msg%n</pattern>
+        </encoder>
+    </appender>
+    <root level="INFO">
+        <appender-ref ref="rolling-info" />
+        <appender-ref ref="rolling-debug" />
+    </root>
+</configuration>

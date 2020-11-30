@@ -1,0 +1,92 @@
+openapi: 3.0.2
+info:
+  title: dataapi
+  description: Data API
+  version: 0.0.0
+servers:
+  - url: http://data-api.psi.ch/v0.0.0
+    description: data API
+components:
+  schemas:
+    EventObject:
+      type: object
+      properties:
+        ts:
+          type: integer
+          format: int64
+        iocTs:
+          type: integer
+          format: int64
+        pulse:
+          type: integer
+          format: int64
+        shape:
+          type: array
+          items:
+            type: integer
+    ChannelData:
+      type: object
+      properties:
+        channel:
+          type: string
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/EventObject"
+    QueryRequest:
+      type: object
+      properties:
+        channels:
+          type: array
+          items:
+            type: string
+        datetimerange:
+          type: object
+          properties:
+            begin:
+              type: string
+            end:
+              type: string
+        split:
+          type: integer
+          default: -1
+        snscount:
+          type: integer
+          default: -1
+    QueryResponse:
+      type: object
+      properties:
+        channels:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChannelData"
+        something1:
+          type: string
+          nullable: false
+  requestBodies:
+    QueryRequestBody:
+      description: Query a set of channels over some time range.
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schema/QueryRequest"
+paths:
+  /oa_query:
+    post:
+      summary: Query data for a set of channels in a chosen time range.
+      description: further description...
+      requestBody:
+        description: Description of request body...
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "200":
+          description: A JSON array of user names
+          content:
+            application/json:
+              schema: 
+                $ref: "#/components/schemas/QueryResponse"
