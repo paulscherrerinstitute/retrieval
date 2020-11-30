@@ -56,6 +56,4 @@ java -Dserver.port=8371 \
 
 ## Deployment
 
-Unfortunately, `bintray.com` is blocked from the machine network by the internal firewall.
-Our in-house artifactory installation is not maintained.
-So there is currently no clear elegant way to ease deployment.
+Please refer to: <https://github.com/paulscherrerinstitute/retrieval-deploy>
