@@ -1,65 +1,80 @@
 package ch.psi.daq.retrieval.controller;
 
-import ch.psi.daq.retrieval.*;
+import ch.psi.daq.retrieval.BufCtx;
+import ch.psi.daq.retrieval.ChannelEventStream;
+import ch.psi.daq.retrieval.KeyspaceToDataParams;
+import ch.psi.daq.retrieval.MapFunctionFactory;
+import ch.psi.daq.retrieval.PositionedDatafile;
+import ch.psi.daq.retrieval.QueryParams;
+import ch.psi.daq.retrieval.ReqCtx;
+import ch.psi.daq.retrieval.bytes.BufCont;
+import ch.psi.daq.retrieval.config.ConfigurationRetrieval;
 import ch.psi.daq.retrieval.eventmap.ts.EventBlobToV1MapTs;
-import ch.psi.daq.retrieval.eventmap.ts.Item;
-import ch.psi.daq.retrieval.eventmap.value.*;
+import ch.psi.daq.retrieval.eventmap.ts.MapTsItemVec;
+import ch.psi.daq.retrieval.eventmap.ts.MapTsToken;
+import ch.psi.daq.retrieval.eventmap.value.AggFunc;
+import ch.psi.daq.retrieval.eventmap.value.AggMapper;
+import ch.psi.daq.retrieval.eventmap.value.AggMax;
+import ch.psi.daq.retrieval.eventmap.value.AggMean;
+import ch.psi.daq.retrieval.eventmap.value.AggMin;
+import ch.psi.daq.retrieval.eventmap.value.AggSum;
+import ch.psi.daq.retrieval.eventmap.value.BinFind;
+import ch.psi.daq.retrieval.eventmap.value.EventBlobMapResult;
+import ch.psi.daq.retrieval.eventmap.value.EventBlobToV1Map;
+import ch.psi.daq.retrieval.eventmap.value.TransformSupplier;
 import ch.psi.daq.retrieval.finder.BaseDirFinderFormatV0;
-import ch.psi.daq.retrieval.merger.Merger;
+import ch.psi.daq.retrieval.finder.TimeBin2;
+import ch.psi.daq.retrieval.merger.MergerSupport;
+import ch.psi.daq.retrieval.merger.Releasable;
 import ch.psi.daq.retrieval.pod.api1.Query;
-import ch.psi.daq.retrieval.pod.api1.Range;
 import ch.psi.daq.retrieval.status.RequestStatus;
 import ch.psi.daq.retrieval.status.RequestStatusBoard;
+import ch.psi.daq.retrieval.throttle.Throttle;
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.turbo.TurboFilter;
 import ch.qos.logback.core.spi.FilterReply;
-import com.fasterxml.jackson.core.JsonFactory;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import io.netty.buffer.ByteBuf;
 import org.slf4j.LoggerFactory;
 import org.slf4j.Marker;
 import org.slf4j.MarkerFactory;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferFactory;
 import org.springframework.core.io.buffer.DataBufferUtils;
-import org.springframework.core.io.buffer.DefaultDataBufferFactory;
-import org.springframework.http.HttpStatus;
+import org.springframework.core.io.buffer.LimitedDataBufferList;
+import org.springframework.core.io.buffer.NettyDataBuffer;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.server.reactive.ServerHttpRequest;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.reactive.function.BodyInserters;
-import org.springframework.web.reactive.function.client.ClientResponse;
-import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
-import reactor.util.function.Tuples;
 
-import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
-import java.time.*;
-import java.util.*;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeoutException;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 public class QueryData {
-    static Logger LOGGER = (Logger) LoggerFactory.getLogger(QueryData.class);
-    DataBufferFactory defaultDataBufferFactory = new DefaultDataBufferFactory();
-    int bufferSize = 64 * 1024;
+    static Logger LOGGER = (Logger) LoggerFactory.getLogger(QueryData.class.getSimpleName());
     public BaseDirFinderFormatV0 baseDirFinder;
     AtomicLong nFilteredEmptyRawOut = new AtomicLong();
-    List<SplitNode> splitNodes;
-    AtomicLong totalBytesServed = new AtomicLong();
-    String canonicalHostname;
-    final RequestStatusBoard requestStatusBoard = new RequestStatusBoard();
+    ConfigurationRetrieval conf;
+    static final String HEADER_X_DAQBUFFER_REQUEST_ID = "x-daqbuffer-request-id";
+    static final String HEADER_X_CANONICALHOSTNAME = "X-CanonicalHostname";
+    public static AtomicLong totalBytesEmitted = new AtomicLong();
+    public static AtomicLong indexSizeSmall = new AtomicLong();
+    public static AtomicLong indexSizeMedium = new AtomicLong();
+    public static AtomicLong indexSizeLarge = new AtomicLong();
+    public static AtomicLong indexSizeHuge = new AtomicLong();
+    public final RequestStatusBoard requestStatusBoard = new RequestStatusBoard();
+    public int port;
 
     static Marker logMarkerWebClientResponse = MarkerFactory.getMarker("WebClientResponse");
     static Marker logMarkerWebClientResponseItem = MarkerFactory.getMarker("WebClientResponseItem");
@@ -102,18 +117,21 @@ public class QueryData {
     static class Timeout2 extends RuntimeException {}
     static class Timeout3 extends RuntimeException {}
 
-    static Scheduler clientsplitnodeiter = Schedulers.newParallel("csn", 16);
+    public static Scheduler clientsplitnodeiter = Schedulers.newParallel("csn", 16);
 
-    public QueryData(BaseDirFinderFormatV0 finder, List<SplitNode> splitNodes, String canonicalHostname) {
+    public QueryData(BaseDirFinderFormatV0 finder, ConfigurationRetrieval conf) {
         this.baseDirFinder = finder;
-        this.splitNodes = splitNodes;
-        this.canonicalHostname = canonicalHostname;
+        this.conf = conf;
     }
 
     long cleanCount = 0;
-    @Scheduled(fixedRate = 4000)
-    void scheduledStatusClean() {
-        cleanCount += 1;
+    public void scheduledStatusClean() {
+        if (cleanCount == Long.MAX_VALUE) {
+            cleanCount = 0;
+        }
+        else {
+            cleanCount += 1;
+        }
         long n1 = requestStatusBoard.gc();
         if (n1 > 0) {
             cleanCount = 0;
@@ -121,118 +139,130 @@ public class QueryData {
         }
     }
 
+    public static class Stats {
+        public long totalBytesEmitted;
+        public long indexSizeSmall;
+        public long indexSizeMedium;
+        public long indexSizeLarge;
+        public long indexSizeHuge;
+        public Stats() {
+            totalBytesEmitted = QueryData.totalBytesEmitted.get();
+            indexSizeSmall = QueryData.indexSizeSmall.get();
+            indexSizeMedium = QueryData.indexSizeMedium.get();
+            indexSizeLarge = QueryData.indexSizeLarge.get();
+            indexSizeHuge = QueryData.indexSizeHuge.get();
+        }
+    }
+
     public RequestStatusBoard requestStatusBoard() {
         return requestStatusBoard;
     }
 
-    public Mono<ResponseEntity<Flux<DataBuffer>>> queryLocal(ReqCtx reqctx, ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
+    public Mono<ResponseEntity<Flux<DataBuffer>>> queryLocal(ReqCtx reqCtx, ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
         ServerHttpRequest req = exchange.getRequest();
         Mono<Flux<DataBuffer>> mret = queryMono
         .doOnError(x -> LOGGER.info("can not parse request"))
         .map(query -> {
-            QueryParams qp = QueryParams.fromQuery(query, defaultDataBufferFactory, bufferSize);
+            QueryParams qp = QueryParams.fromQuery(query, reqCtx.bufCtx.bufFac, reqCtx.bufCtx.bufferSize);
             LOGGER.info(String.format("queryLocal  %s  %s  %s  %s", req.getId(), qp.begin, qp.end, qp.channels));
             long endNanos = 1000000L * qp.end.toEpochMilli();
             class MakeTrans implements MapFunctionFactory<EventBlobMapResult> {
-                ReqCtx reqctx;
-                QueryParams qp;
-                long endNanos;
+                final ReqCtx reqctx;
+                final QueryParams qp;
+                final long endNanos;
                 public MakeTrans(ReqCtx reqctx, QueryParams qp, long endNanos) {
                     this.reqctx = reqctx;
                     this.qp = qp;
                     this.endNanos = endNanos;
                 }
                 @Override
-                public Flux<EventBlobMapResult> makeTrans(Flux<DataBuffer> fl, KeyspaceToDataParams kspp, int fileno) {
-                    return EventBlobToV1Map.trans2(reqctx, fl, kspp.ksp.channel.name, endNanos, kspp.bufFac, kspp.bufferSize, qp.decompressOnServer, qp.limitBytes);
+                public Flux<EventBlobMapResult> makeTrans(Flux<BufCont> fl, KeyspaceToDataParams kspp, int fileno) {
+                    return EventBlobToV1Map.trans(reqctx, fl, kspp.ksp.channel.name, endNanos, kspp.bufFac, kspp.bufferSize, qp);
                 }
             }
             Function<KeyspaceToDataParams, Mono<List<Flux<EventBlobMapResult>>>> keyspaceToData = p -> {
-                return ChannelEventStream.dataFluxFromFiles(p, new MakeTrans(reqctx, qp, endNanos));
+                return ChannelEventStream.dataFluxFromFiles(p, new MakeTrans(reqCtx, qp, endNanos), reqCtx.bufCtx);
             };
-            return channelsToData(reqctx, exchange, baseDirFinder, qp.channels, qp.begin, qp.end, qp.splits, qp.bufFac, qp.bufferSize, keyspaceToData)
-            .doOnDiscard(EventBlobMapResult.class, obj -> obj.release())
-            .map(x -> x.buf);
+            return channelsToData(reqCtx, baseDirFinder, qp.channels, qp.begin, qp.end, qp.splits, reqCtx.bufCtx, keyspaceToData)
+            .transform(doDiscard("queryLocalEnd"))
+            .concatMapIterable(EventBlobMapResult::takeBufCont, 4)
+            .map(BufCont::takeBuf)
+            .filter(Optional::isPresent)
+            .map(Optional::get);
         });
-        return logResponse(reqctx, "queryLocal", mret);
+        return logResponse(reqCtx, "queryLocal", mret);
     }
 
-    static class TransMapTsForRaw implements MapFunctionFactory<Item> {
-        ReqCtx reqctx;
-        QueryParams qp;
-        long endNanos;
-        String channelName;
-        public TransMapTsForRaw(ReqCtx reqctx, QueryParams qp, long endNanos, String channelName) {
-            this.reqctx = reqctx;
-            this.qp = qp;
-            this.endNanos = endNanos;
-            this.channelName = channelName;
-        }
-        @Override
-        public Flux<Item> makeTrans(Flux<DataBuffer> fl, KeyspaceToDataParams kspp, int fileno) {
-            return EventBlobToV1MapTs.trans2(reqctx, EventBlobToV1MapTs.Mock.NONE, fl, String.format("rawLocal_sp%02d/%d_f%02d", qp.splits.get(0), qp.splits.size(), fileno), channelName, endNanos, kspp.bufFac, qp.bufferSize);
-        }
-    }
 
-    public Mono<ResponseEntity<Flux<DataBuffer>>> rawLocal(ReqCtx reqctx, ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        ServerHttpRequest req = exchange.getRequest();
-        String mainReqId;
+    public Mono<ResponseEntity<Flux<DataBuffer>>> rawLocal(ReqCtx reqCtx, ServerWebExchange exchange, Mono<Query> queryMono) {
+        String mainReqId2;
         try {
-            mainReqId = req.getHeaders().get("x-main-req-id").get(0);
+            mainReqId2 = exchange.getRequest().getHeaders().get("x-main-req-id").get(0);
         }
         catch (NullPointerException | IndexOutOfBoundsException e) {
-            mainReqId = "NOREQID";
+            mainReqId2 = "NOREQID";
         }
-        requestStatusBoard.requestSubBegin(reqctx, mainReqId);
-        DataBufferFactory bufFac = exchange.getResponse().bufferFactory();
+        String mainReqId = mainReqId2;
+        return queryMono
+        .flatMap(query -> {
+            return rawLocalInner(reqCtx, Mono.just(query), mainReqId)
+            .flatMap(fl -> {
+                return logResponse(reqCtx, "rawLocal", Mono.just(fl));
+            });
+        });
+    }
+
+    public Mono<Flux<DataBuffer>> rawLocalInner(ReqCtx reqCtx, Mono<Query> queryMono, String mainReqId) {
+        requestStatusBoard.requestSubBegin(reqCtx, mainReqId);
+        DataBufferFactory bufFac = reqCtx.bufCtx.bufFac;
         AtomicLong totalBytesEmit = new AtomicLong();
         Mono<Flux<DataBuffer>> mret = queryMono
-        .doOnError(x -> LOGGER.error("{}  can not parse request", reqctx))
+        .doOnError(x -> LOGGER.error("{}  can not parse request", reqCtx))
         .map(query -> {
-            QueryParams qp = QueryParams.fromQuery(query, defaultDataBufferFactory, bufferSize);
+            QueryParams qp = QueryParams.fromQuery(query, reqCtx.bufCtx.bufFac, reqCtx.bufCtx.bufferSize);
             if (qp.channels.size() != 1) {
-                LOGGER.error("{}  rawLocal  requested more than one channel  {}  {}  {}", reqctx, qp.begin, qp.end, qp.channels);
+                LOGGER.error("{}  rawLocal  requested more than one channel  {}  {}  {}", reqCtx, qp.begin, qp.end, qp.channels);
                 throw new RuntimeException("logic");
             }
             final String channelName = "" + qp.channels.get(0);
-            LOGGER.debug("{}  rawLocal  {}  {}  {}", reqctx, qp.begin, qp.end, qp.channels);
+            LOGGER.info("{}  rawLocal  {}  {}  {}", reqCtx, qp.begin, qp.end, qp.channels);
             long endNanos = 1000000L * qp.end.toEpochMilli();
-            Function<KeyspaceToDataParams, Mono<List<Flux<Item>>>> keyspaceToData = p -> {
-                return ChannelEventStream.dataFluxFromFiles(p, new TransMapTsForRaw(reqctx, qp, endNanos, channelName));
+            Function<KeyspaceToDataParams, Mono<List<Flux<MapTsItemVec>>>> keyspaceToData = p -> {
+                return ChannelEventStream.dataFluxFromFiles(p, new TransMapTsForRaw(reqCtx, qp, endNanos, channelName), reqCtx.bufCtx);
             };
-            return channelsToData(reqctx, exchange, baseDirFinder, qp.channels, qp.begin, qp.end, qp.splits, qp.bufFac, qp.bufferSize, keyspaceToData)
+            return channelsToData(reqCtx, baseDirFinder, qp.channels, qp.begin, qp.end, qp.splits, reqCtx.bufCtx, keyspaceToData)
             .doOnNext(item -> {
-                if (item.isTerm()) {
-                    LOGGER.debug("{}  rawLocal  term item  channel {}", reqctx, channelName);
+                if (!item.notTerm()) {
+                    LOGGER.debug("{}  rawLocal  term item  channel {}", reqCtx, channelName);
                     item.release();
                 }
             })
-            .doOnDiscard(Item.class, item -> {
-                LOGGER.warn("{}  rawLocal  discard item  channel {}", reqctx, channelName);
-                item.release();
-            })
-            .takeWhile(item -> !item.isTerm())
-            .flatMapIterable(item -> item.takeBuffers())
-            .doOnNext(buf -> {
-                reqctx.addBodyLen(buf);
-                totalBytesEmit.getAndAdd(buf.readableByteCount());
-            })
+            .takeWhile(MapTsItemVec::notTerm)
+            .doOnNext(kk -> kk.markWith(BufCont.Mark.QUERY_DATA_RAW_LOCAL_01))
+            .concatMapIterable(MapTsItemVec::takeBuffers, 1)
+            .doOnNext(kk -> kk.appendMark(BufCont.Mark.QUERY_DATA_RAW_LOCAL_02))
+            .transform(doDiscard("rawLocalMiddle"))
+            .map(BufCont::takeBuf)
+            .filter(Optional::isPresent).map(Optional::get)
+            .takeWhile(buf -> qp.limitBytesPerChannel == 0 || totalBytesEmit.get() < qp.limitBytesPerChannel)
             .doOnSubscribe(s -> {
-                LOGGER.debug("{}  rawLocal sig  SUBSCRIBE {}", reqctx, channelName);
+                LOGGER.debug("{}  rawLocal sig  SUBSCRIBE {}", reqCtx, channelName);
             })
             .doOnCancel(() -> {
-                LOGGER.info("{}  rawLocal sig  CANCEL    {}", reqctx, channelName);
+                LOGGER.info("{}  rawLocal sig  CANCEL    {}", reqCtx, channelName);
             })
             .doOnComplete(() -> {
-                LOGGER.debug("{}  rawLocal sig  COMPLETE   {}  bytes {}", reqctx, channelName, totalBytesEmit.get());
+                LOGGER.debug("{}  rawLocal sig  COMPLETE   {}  bytes {}", reqCtx, channelName, totalBytesEmit.get());
             })
             .doOnError(e -> {
-                LOGGER.error("{}  rawLocal  ERROR  {}  {}", reqctx, channelName, e.toString());
-                requestStatusBoard.requestErrorChannelName(reqctx, channelName, e);
+                LOGGER.error("{}  rawLocal  ERROR  {}  {}", reqCtx, channelName, e.toString());
+                requestStatusBoard.requestErrorChannelName(reqCtx, channelName, e);
             })
-            .doOnTerminate(() -> {
-                requestStatusBoard.bodyEmitted(reqctx);
-                LOGGER.debug("{}  rawLocal sig  TERMINATE  {}", reqctx, channelName);
+            .doOnNext(buf -> {
+                int rb = buf.readableByteCount();
+                totalBytesEmit.getAndAdd(rb);
+                QueryData.totalBytesEmitted.getAndAdd(rb);
+                reqCtx.addBodyLen(rb);
             })
             .filter(buf -> {
                 if (buf.readableByteCount() > 0) {
@@ -240,503 +270,198 @@ public class QueryData {
                 }
                 else {
                     nFilteredEmptyRawOut.getAndAdd(1);
-                    DataBufferUtils.release(buf);
                     return false;
                 }
-            });
+            })
+            .transform(fl -> Throttle.throttle(fl, qp.throttleRate / 8, qp.throttleSteps, qp.throttleInterval, qp.throttleOverslack))
+            .transform(statusPing(reqCtx, this))
+            .transform(doDiscard("rawLocalEnd"))
+            .doFinally(sig -> requestStatusBoard.bodyEmitted(reqCtx, sig));
         })
         .map(fl -> {
             return Flux.just(bufFac.wrap(new byte[] { 'P', 'R', 'E', '0' }))
             .concatWith(fl);
         })
         .doOnError(e -> {
-            LOGGER.error("{}  rawLocal  {}", reqctx, e.toString());
-            requestStatusBoard.requestError(reqctx, e);
+            LOGGER.error("{}  rawLocal  {}", reqCtx, e.toString());
+            requestStatusBoard.requestError(reqCtx, e);
         });
-        return logResponse(reqctx, "rawLocal", mret);
+        return mret;
     }
 
 
-    static class TokenSinker {
-        BlockingQueue<Integer> queue;
-        AtomicLong n1 = new AtomicLong();
-        TokenSinker(int n) {
-            queue = new LinkedBlockingQueue<>(3 * n + 3);
-            for (int i1 = 0; i1 < n; i1 += 1) {
-                putBack(i1);
-            }
-        }
-        void putBack(int token) {
-            queue.add((((int)n1.getAndAdd(1)) * 10000) + (token % 10000));
+    interface MergeFunction {
+        Flux<BufCont> apply(ReqCtx reqctx, List<Flux<MapTsItemVec>> lfl, String channelName, QueryParams qp, BufCtx bufCtx);
+    }
+
+    static class MergeFunctionDefault implements MergeFunction {
+        @Override
+        public Flux<BufCont> apply(ReqCtx reqctx, List<Flux<MapTsItemVec>> lfl, String channelName, QueryParams qp, BufCtx bufCtx) {
+            return MergerSupport.flattenSlices(MergerSupport.mergeItemVecFluxes(lfl, qp), channelName, qp, bufCtx);
         }
     }
 
-    Mono<ClientResponse> springWebClientRequest(ReqCtx reqctx, String localURL, String channelName, String js) {
-        return WebClient.builder()
-        .baseUrl(localURL)
-        .build()
-        .post()
-        .contentType(MediaType.APPLICATION_JSON)
-        .accept(MediaType.APPLICATION_OCTET_STREAM)
-        .header("Connection", "close")
-        .header("x-main-req-id", reqctx.reqId)
-        .body(BodyInserters.fromValue(js))
-        .exchange()
-        .doOnError(e -> {
-            LOGGER.error("{}  WebClient exchange doOnError {}", reqctx, e.toString());
-        })
-        .doOnNext(x -> {
-            String remote_reqid = x.headers().header("x-daqbuffer-request-id").get(0);
-            LOGGER.debug("{}  WebClient got status {}  {}  remote x-daqbuffer-request-id {}", reqctx, x.statusCode(), channelName, remote_reqid);
-            if (x.statusCode() != HttpStatus.OK) {
-                LOGGER.error("{}  WebClient got status {}  {}", reqctx, x.statusCode(), channelName);
-                throw new RuntimeException("sub request not OK");
-            }
-            if (!x.headers().header("connection").contains("close")) {
-                LOGGER.error("{}  WebClient no conn close header  {}", reqctx, channelName);
-                for (Map.Entry<String, List<String>> e : x.headers().asHttpHeaders().entrySet()) {
-                    LOGGER.error("{}  header: {}", reqctx, e.getKey());
-                    for (String v : e.getValue()) {
-                        LOGGER.error("{}   v: {}", reqctx, v);
-                    }
-                }
-                LOGGER.error("{}  {}", reqctx, x.headers().toString());
-                throw new RuntimeException("Expect Connection close in answer");
-            }
+    static class MergeFunctionFake implements MergeFunction {
+        @Override
+        public Flux<BufCont> apply(ReqCtx reqctx, List<Flux<MapTsItemVec>> lfl, String channelName, QueryParams qp, BufCtx bufCtx) {
+            //Flux<MapTsItemVec> all = lfl.get(0).subscribeOn(Schedulers.parallel());
+            List<Flux<MapTsItemVec>> lfl2 = lfl.stream().map(k -> k.subscribeOn(Schedulers.parallel())).collect(Collectors.toList());
+            return Flux.merge(Flux.fromIterable(lfl2), lfl.size(), 1)
+            .concatMapIterable(k -> {
+                return k.testTakeBuffers();
+            });
+            //return MergerSupport.flattenSlices(MergerSupport.mergeItemVecFluxes(lfl), channelName, qp, bufCtx);
+        }
+    }
+
+    Flux<BufCont> pipeThroughMergerFake(ReqCtx reqctx, List<Flux<MapTsItemVec>> lfl, String channelName, QueryParams qp, BufCtx bufCtx) {
+        return Flux.concat(lfl)
+        .map(k -> {
+            k.release();
+            return BufCont.makeEmpty(BufCont.Mark.MERGER_FAKE);
         });
     }
 
-    enum RequestStatusResultType {
-        RequestStaus,
-        ByteBuffer,
+    Flux<BufCont> pipeThroughMerger(ReqCtx reqctx, List<Flux<MapTsItemVec>> lfl, String channelName, QueryParams qp, BufCtx bufCtx) {
+        return MergerSupport.flattenSlices(MergerSupport.mergeItemVecFluxes(lfl, qp), channelName, qp, bufCtx);
     }
 
-    static class RequestStatusResult {
-        RequestStatusResultType ty;
-        RequestStatus requestStatus;
-        ByteBuffer byteBuffer;
-        RequestStatusResult(RequestStatus k) {
-            ty = RequestStatusResultType.RequestStaus;
-            requestStatus = k;
-        }
-        RequestStatusResult(ByteBuffer k) {
-            ty = RequestStatusResultType.ByteBuffer;
-            byteBuffer = k;
-        }
-    }
-
-    Mono<RequestStatusResult> getRequestStatus(ReqCtx reqctx, String host, int port, String reqId) {
-        String requestStatusUrl = String.format("http://%s:%d/api/1/requestStatus/%s", host, port, reqId);
-        return WebClient.builder()
-        .baseUrl(requestStatusUrl)
-        .build()
-        .get()
-        .exchange()
-        .doOnError(e2 -> {
-            LOGGER.error("{}  requestStatus exchange doOnError {}", reqctx, e2.toString());
-        })
-        .flatMap(x -> {
-            if (x.statusCode() == HttpStatus.OK) {
-                LOGGER.debug("{}  requestStatus  http status {}", reqctx, x.statusCode());
+    public Mono<ResponseEntity<Flux<DataBuffer>>> queryMergedOctets(ReqCtx reqCtx, Mono<Query> queryMono) {
+        LOGGER.info("{}  queryMergedOctets", reqCtx);
+        requestStatusBoard.requestBegin(reqCtx);
+        AtomicLong haveNettyCount = new AtomicLong();
+        AtomicLong nonNettyCount = new AtomicLong();
+        Mono<Flux<DataBuffer>> mret = queryMono
+        .doOnError(x -> LOGGER.error("{}  can not parse request", reqCtx))
+        .map(query -> {
+            QueryParams qp = QueryParams.fromQuery(query, reqCtx.bufCtx.bufFac, reqCtx.bufCtx.bufferSize);
+            LOGGER.info("{}  queryMergedOctets  {}  {}  {}  {}", reqCtx, qp.begin, qp.end, qp.channels, qp.splits);
+            AtomicLong nbytes = new AtomicLong();
+            TransformSupplier<BufCont> valuemapSup;
+            if (qp.valuemapType == 1) {
+                valuemapSup = new TransMapQueryMergedFake(reqCtx, qp);
             }
             else {
-                LOGGER.error("{}  requestStatus  http status {}", reqctx, x.statusCode());
+                valuemapSup = new TransMapQueryMergedDefault(reqCtx, qp);
             }
-            return x.bodyToMono(ByteBuffer.class);
-        })
-        .map(buf -> {
-            String remoteBodyMsg = StandardCharsets.UTF_8.decode(buf).toString();
-            try {
-                LOGGER.debug("{}  remote gave message {}", reqctx, remoteBodyMsg);
-                return new RequestStatusResult((new ObjectMapper()).readValue(remoteBodyMsg, RequestStatus.class));
+            MergeFunction mergeFunction;
+            if (qp.mergeType == 1) {
+                mergeFunction = new MergeFunctionFake();
             }
-            catch (IOException e2) {
-                LOGGER.error("{}  getRequestStatus can not parse  {}  {}", reqctx, e2.toString(), remoteBodyMsg);
-                return new RequestStatusResult(buf);
+            else {
+                mergeFunction = new MergeFunctionDefault();
             }
-        });
-    }
-
-    Flux<DataBuffer> pipeThroughMergerFake(ReqCtx reqctx, List<Flux<Item>> lfl, String channelName, QueryParams qp) {
-        return Flux.concat(lfl)
-        .map(item -> {
-            if (item.item1 == null) {
-                throw new RuntimeException("item1 is null");
-            }
-            DataBuffer ret = item.item1.buf;
-            if (ret == null) {
-                LOGGER.error("{}  null item", reqctx);
-                throw new RuntimeException("bad null");
-            }
-            if (item.item2 != null && item.item2.buf != null) {
-                DataBufferUtils.release(item.item2.buf);
-            }
-            return ret;
-        });
-    }
-
-    Flux<DataBuffer> pipeThroughMerger(ReqCtx reqctx, List<Flux<Item>> lfl, String channelName, QueryParams qp) {
-        AtomicLong totalSeenItems = new AtomicLong();
-        AtomicLong totalRequestedItems = new AtomicLong();
-        return Flux.from(new Merger(reqctx, channelName, lfl, qp.bufFac, qp.bufferSize))
-        .doOnRequest(n -> {
-            if (n > 50000) {
-                LOGGER.warn("{}  large item request {}", reqctx, n);
-            }
-            long tot = totalRequestedItems.addAndGet(n);
-            long rec = totalSeenItems.get();
-            LOGGER.debug("{}  API_1_0_1 FL requesting from Merger  {}  total {}  seen {}", reqctx, n, tot, rec);
-        })
-        .doOnCancel(() -> {
-            LOGGER.info("{}  API_1_0_1 FL cancel Merger", reqctx);
-        })
-        .doOnNext(buf -> {
-            long rec = totalSeenItems.addAndGet(1);
-            long tot = totalRequestedItems.get();
-            LOGGER.trace("{}  API_1_0_1 FL item   total {}  seen {}", reqctx, tot, rec);
-        })
-        .doOnTerminate(() -> {
-            LOGGER.debug("{}  API_1_0_1 FL TERMINATED", reqctx);
-        });
-    }
-
-    <T> Flux<T> buildMerged(ReqCtx reqctx, QueryParams qp, TransformSupplier<T> transformSupplier) {
-        final int nChannels = qp.channels.size();
-        final AtomicLong oChannels = new AtomicLong();
-        TokenSinker tsinker = new TokenSinker(splitNodes.size());
-        Flux<Flux<T>> fcmf = Flux.fromIterable(qp.channels)
-        .map(channelName -> {
-            long channelIx = oChannels.getAndAdd(1);
-            LOGGER.debug("{}  buildMerged next channel {}", reqctx, channelName);
-            return Flux.fromIterable(splitNodes)
-            .subscribeOn(clientsplitnodeiter)
-            .filter(sn -> qp.splits == null || qp.splits.isEmpty() || qp.splits.contains(sn.split))
-            .doOnNext(sn -> {
-                LOGGER.debug("{}  buildMerged next split node  sn {} {}  sp {}", reqctx, sn.host, sn.port, sn.split);
-            })
-            .zipWith(Flux.<Integer>create(sink -> {
-                AtomicLong tState = new AtomicLong();
-                sink.onRequest(reqno -> {
-                    long stn = tState.getAndAdd(1);
-                    if (stn < 0 || stn > splitNodes.size()) {
-                        LOGGER.error("{}  Too many sub-requests {}", reqctx, stn);
-                        throw new RuntimeException("logic");
-                    }
-                    if (reqno != 1) {
-                        throw new RuntimeException("bad request limit");
-                    }
-                    new Thread(() -> {
-                        try {
-                            int a = tsinker.queue.take();
-                            sink.next(a);
-                        }
-                        catch (InterruptedException e) {
-                            throw new RuntimeException(e);
-                        }
-                    }).start();
-                });
-                sink.onCancel(() -> {
-                    LOGGER.debug("{}  Token flux cancelled", reqctx);
-                });
-                sink.onDispose(() -> {
-                    LOGGER.debug("{}  Dispose of token flux", reqctx);
-                });
-            })
-            .doOnDiscard(Integer.class, tok -> tsinker.putBack(tok))
-            .limitRate(1)
-            .publishOn(clientsplitnodeiter),
-            1)
-            .concatMap(tok -> {
-                SplitNode sn = tok.getT1();
-                Integer token = tok.getT2();
-                LOGGER.debug("{}  buildMerged Query  {}  {}/{}  sn {} {}  sp {}  token {}", reqctx, channelName, channelIx, nChannels, sn.host, sn.port, sn.split, token);
-                String localURL = String.format("http://%s:%d/api/1/rawLocal", sn.host, sn.port);
-                Query subq = new Query();
-                subq.decompressOnServer = 0;
-                subq.bufferSize = qp.bufferSize;
-                subq.channels = List.of(channelName);
-                Range range = new Range();
-                range.startDate = qp.beginString;
-                range.endDate = qp.endString;
-                subq.range = range;
-                subq.splits = List.of(sn.split);
-                String js;
-                try {
-                    ObjectMapper mapper = new ObjectMapper(new JsonFactory());
-                    js = mapper.writeValueAsString(subq);
-                }
-                catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
-                AtomicLong skipInResponse = new AtomicLong(4);
-                Mono<Flux<Item>> m3 = springWebClientRequest(reqctx, localURL, channelName, js)
-                .map(clientResponse -> {
-                    LOGGER.debug(logMarkerWebClientResponse, "{}  WebClient  create body flux  channel {}  sn {} {}  sp {}", reqctx, channelName, sn.host, sn.port, sn.split);
-                    String remote_reqid = clientResponse.headers().header("x-daqbuffer-request-id").get(0);
-                    return Tuples.of(remote_reqid, clientResponse.bodyToFlux(DataBuffer.class));
-                })
-                .<Flux<Item>>map(tup -> {
-                    String remote_reqid = tup.getT1();
-                    Flux<DataBuffer> flbuf = tup.getT2();
-                    return flbuf.doOnSubscribe(s -> {
-                        LOGGER.debug(logMarkerWebClientResponse, "{}  WebClient Response  {}  {}  {}  SUBSCRIBE", reqctx, channelName, sn.host, sn.split);
-                    })
-                    .doOnNext(buf -> {
-                        int readable = buf.readableByteCount();
-                        long skip = skipInResponse.get();
-                        LOGGER.trace(logMarkerWebClientResponseItem, "{}  WebClient Response  {}  {}  {}  NEXT   skip-A {} / {}", reqctx, channelName, sn.host, sn.split, skip, readable);
-                        if (skip > 0) {
-                            if (skip > readable) {
-                                skip = readable;
-                            }
-                            buf.readPosition(buf.readPosition() + (int) skip);
-                            skipInResponse.getAndAdd(-skip);
-                        }
-                    })
-                    .onErrorResume(e -> {
-                        LOGGER.error("{}  WebClient error, call getRequestStatus", reqctx);
-                        return getRequestStatus(reqctx, sn.host, sn.port, remote_reqid)
-                        .flatMapMany(res -> {
-                            if (res.requestStatus != null) {
-                                requestStatusBoard.getOrCreate(reqctx).addSubRequestStatus(res.requestStatus);
-                            }
-                            else {
-                                String s1 = StandardCharsets.UTF_8.decode(res.byteBuffer).toString();
-                                requestStatusBoard.getOrCreate(reqctx).addError(new RequestStatus.Error(s1));
-                            }
-                            return Flux.error(new RuntimeException("subnode error"));
-                        });
-                    })
-                    .doOnCancel(() -> {
-                        LOGGER.info(logMarkerWebClientResponse, "{}  WebClient Response  {}  {}  {}  CANCEL", reqctx, channelName, sn.host, sn.split);
-                    })
-                    .doOnComplete(() -> {
-                        LOGGER.debug(logMarkerWebClientResponse, "{}  WebClient Response  {}  {}  {}  COMPLETE", reqctx, channelName, sn.host, sn.split);
-                        tsinker.putBack(token);
-                    })
-                    .doOnTerminate(() -> {
-                        LOGGER.debug(logMarkerWebClientResponse, "{}  WebClient Response  {}  {}  {}  TERMINATE", reqctx, channelName, sn.host, sn.split);
-                    })
-                    .timeout(Duration.ofMillis(40000))
-                    .onErrorMap(TimeoutException.class, e -> {
-                        LOGGER.error("{}  Timeout1  channel {}  {} {}  {}", reqctx, channelName, sn.host, sn.port, sn.split);
-                        return new Timeout1();
-                    })
-                    .transform(fbuf2 -> EventBlobToV1MapTs.trans2(reqctx, EventBlobToV1MapTs.Mock.NONE, fbuf2, String.format("__sn_%02d__buildMerged__%s", sn.split, channelName), channelName, qp.endNanos, qp.bufFac, qp.bufferSize))
-                    .timeout(Duration.ofMillis(60000))
-                    .onErrorMap(TimeoutException.class, e -> {
-                        LOGGER.error("{}  Timeout2  channel {}  {} {}  {}", reqctx, channelName, sn.host, sn.port, sn.split);
-                        return new Timeout2();
-                    })
-                    .doOnComplete(() -> {
-                        LOGGER.debug("{}  after EventBlobToV1MapTs  {}  {}  COMPLETE", reqctx, channelName, sn.host);
-                    })
-                    .doOnTerminate(() -> {
-                        LOGGER.debug("{}  after EventBlobToV1MapTs  {}  {}  TERMINATE", reqctx, channelName, sn.host);
-                    })
-                    .transform(fl3 -> logFlux(reqctx, String.format("merged_sn%02d_ts_flux_ts", sn.split), fl3))
-                    .concatWith(Mono.defer(() -> {
-                        return getRequestStatus(reqctx, sn.host, sn.port, remote_reqid)
-                        .flatMap(res -> {
-                            if (res.requestStatus != null) {
-                                requestStatusBoard.getOrCreate(reqctx).addSubRequestStatus(res.requestStatus);
-                            }
-                            else {
-                                String s1 = StandardCharsets.UTF_8.decode(res.byteBuffer).toString();
-                                requestStatusBoard.getOrCreate(reqctx).addError(new RequestStatus.Error(s1));
-                            }
-                            return Mono.<Item>empty();
-                        });
-                    }));
-                });
-                return logMono(reqctx, String.format("merged_sn%02d_ts_mono_sub", sn.split), m3);
-            })
-            .collectList()
-            .<Flux<DataBuffer>>map(lfl -> pipeThroughMerger(reqctx, lfl, channelName, qp))
-            .flatMapMany(fl12 -> transformSupplier.trans3(fl12, channelName))
-            .doOnSubscribe(s -> {
-                LOGGER.debug("{}  merged stream SUBSCRIBE  {}", reqctx, channelName);
-            })
-            .doOnCancel(() -> {
-                LOGGER.info("{}  merged stream CANCEL     {}", reqctx, channelName);
-            })
-            .doOnComplete(() -> {
-                LOGGER.debug("{}  merged stream COMPLETE   {}", reqctx, channelName);
-            })
-            .doOnTerminate(() -> {
-                LOGGER.debug("{}  merged stream TERMINATE  {}", reqctx, channelName);
-            })
-            .timeout(Duration.ofMillis(80000))
-            .onErrorMap(TimeoutException.class, e -> {
-                LOGGER.error("{}  Timeout3  channel {}", reqctx, channelName);
-                return new Timeout3();
-            });
-        });
-        return fcmf
-        .<T>concatMap(x -> x, 1);
-    }
-
-    static class TransMapQueryMerged implements TransformSupplier<DataBuffer> {
-        QueryParams qp;
-        ReqCtx reqctx;
-        TransMapQueryMerged(ReqCtx reqctx, QueryParams qp) {
-            this.reqctx = reqctx;
-            this.qp = qp;
-        }
-        public Flux<DataBuffer> trans3(Flux<DataBuffer> fl, String channelName) {
-            return EventBlobToV1Map.trans2(reqctx, fl, channelName, qp.endNanos, qp.bufFac, qp.bufferSize, qp.decompressOnServer, qp.limitBytes)
-            .map(res -> {
-                if (res.buf == null) {
-                    LOGGER.error("{} BAD: res.buf == null", reqctx);
-                    throw new RuntimeException("BAD: res.buf == null");
-                }
-                return res.buf;
-            });
-        }
-    }
-
-    static class TransMapQueryMergedFake implements TransformSupplier<DataBuffer> {
-        QueryParams qp;
-        ReqCtx reqctx;
-        TransMapQueryMergedFake(ReqCtx reqctx, QueryParams qp) {
-            this.reqctx = reqctx;
-            this.qp = qp;
-        }
-        public Flux<DataBuffer> trans3(Flux<DataBuffer> fl, String channelName) {
-            return fl;
-        }
-    }
-
-    public Mono<ResponseEntity<Flux<DataBuffer>>> queryMergedOctets(ReqCtx reqctx, ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        requestStatusBoard.requestBegin(reqctx);
-        ServerHttpRequest req = exchange.getRequest();
-        if (!req.getHeaders().getAccept().contains(MediaType.APPLICATION_OCTET_STREAM)) {
-            LOGGER.warn("{}  queryMerged  Client omits Accept: {}", reqctx, MediaType.APPLICATION_OCTET_STREAM);
-        }
-        Mono<Flux<DataBuffer>> mret = queryMono
-        .doOnError(x -> LOGGER.error("{}  can not parse request", reqctx))
-        .map(query -> {
-            QueryParams qp = QueryParams.fromQuery(query, exchange.getResponse().bufferFactory(), bufferSize);
-            LOGGER.debug("{}  queryMerged  {}  {}  {}", reqctx, qp.begin, qp.end, qp.channels);
-            AtomicLong nbytes = new AtomicLong();
-            return buildMerged(reqctx, qp, new TransMapQueryMerged(reqctx, qp))
+            return SubTools.buildMerged(reqCtx, qp, valuemapSup, mergeFunction, requestStatusBoard(), conf)
             .doOnSubscribe(nreq1 -> {
-                LOGGER.trace("{}  doOnSubscribe  queryMergedOctets: subscribing to result from buildMerged", reqctx);
+                LOGGER.trace("{}  doOnSubscribe  queryMergedOctets: subscribing to result from buildMerged", reqCtx);
             })
-            .doOnNext(buf -> {
-                if (buf == null) {
-                    LOGGER.error("{}  buf is null, can not add readable byte count", reqctx);
+            .doOnNext(bufcont -> {
+                if (bufcont == null) {
+                    LOGGER.error("{}  bufcont is null, can not add readable byte count", reqCtx);
                     throw new RuntimeException("logic");
                 }
-                else {
-                    reqctx.addBodyLen(buf);
-                    LOGGER.trace(logMarkerQueryMergedItems, "{}  queryMerged  net emit  len {}", reqctx, buf.readableByteCount());
-                    long h = nbytes.addAndGet(buf.readableByteCount());
-                    if (query.errorAfterBytes > 0 && h > query.errorAfterBytes) {
-                        throw new RuntimeException("Byte limit reached");
-                    }
+                LOGGER.trace(logMarkerQueryMergedItems, "{}  queryMerged  net emit  len {}", reqCtx, bufcont.readableByteCount());
+                long h = nbytes.addAndGet(bufcont.readableByteCount());
+                if (query.errorAfterBytes > 0 && h > query.errorAfterBytes) {
+                    throw new RuntimeException("Byte limit reached");
                 }
             })
-            .doOnComplete(() -> {
-                LOGGER.debug("{}  queryMerged COMPLETE", reqctx);
-            })
-            .doOnTerminate(() -> {
-                requestStatusBoard.bodyEmitted(reqctx);
-                LOGGER.debug("{}  queryMerged TERMINATE", reqctx);
-                LOGGER.info("RequestStatus bodyEmitted summary {}", requestStatusBoard.getOrCreate(reqctx).summary());
-            })
             .doOnError(e -> {
-                LOGGER.error("{}  queryMerged ERROR  {}", reqctx, e.toString());
-                requestStatusBoard.getOrCreate(reqctx).addError(new RequestStatus.Error(e.toString()));
+                LOGGER.error("{}  queryMerged ERROR  {}", reqCtx, e.toString());
+                requestStatusBoard.getOrCreate(reqCtx).addError(new RequestStatus.Error(e.toString()));
+            })
+            .map(BufCont::takeBuf)
+            .filter(Optional::isPresent)
+            .map(Optional::get)
+            .doOnNext(k -> {
+                int rb = k.readableByteCount();
+                QueryData.totalBytesEmitted.getAndAdd(rb);
+                reqCtx.addBodyLen(rb);
+            })
+            .doOnNext(k -> {
+                if (k instanceof NettyDataBuffer) {
+                    haveNettyCount.getAndAdd(1);
+                    ByteBuf bb = ((NettyDataBuffer) k).getNativeBuffer();
+                    if (bb != null) {
+                        if (bb.refCnt() == 0) {
+                            LOGGER.info("bad output of refCnt 0");
+                        }
+                    }
+                }
+                else {
+                    nonNettyCount.getAndAdd(1);
+                }
+            })
+            .transform(fl -> Throttle.throttle(fl, qp.throttleRate, qp.throttleSteps, qp.throttleInterval, qp.throttleOverslack))
+            .transform(statusPing(reqCtx, this))
+            .transform(doDiscard("queryMergedOctetsFinal"))
+            .doOnDiscard(Object.class, QueryData::doDiscardFinal)
+            .doFinally(sig -> requestStatusBoard.bodyEmitted(reqCtx, sig))
+            .doFinally(k -> {
+                LOGGER.info("haveNettyCount {}  nonNettyCount {}", haveNettyCount.get(), nonNettyCount.get());
             });
         });
-        return logResponse(reqctx, "queryMerged", mret);
+        return logResponse(reqCtx, "queryMergedOctets", mret);
     }
 
-    static class MakeTrans2 implements MapFunctionFactory<DataBuffer> {
-        @Override
-        public Flux<DataBuffer> makeTrans(Flux<DataBuffer> fl, KeyspaceToDataParams kspp, int fileno) {
-            return fl;
-        }
+    public Mono<ResponseEntity<Flux<DataBuffer>>> queryMergedOctetsLocal(ReqCtx reqCtx, Mono<Query> queryMono) {
+        return queryMono.map(q -> {
+            return queryMergedOctetsLocal_current(reqCtx, Mono.just(q));
+        })
+        .flatMap(k -> k);
     }
 
-    public Mono<ResponseEntity<Flux<DataBuffer>>> queryMergedOctetsLocal(ReqCtx reqctx, ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        requestStatusBoard.requestBegin(reqctx);
+    public Mono<ResponseEntity<Flux<DataBuffer>>> queryMergedOctetsLocal_current(ReqCtx reqCtx, Mono<Query> queryMono) {
+        LOGGER.info("{}  queryMergedOctetsLocal", reqCtx);
+        requestStatusBoard.requestBegin(reqCtx);
         Mono<Flux<DataBuffer>> mret = queryMono
-        .doOnError(x -> LOGGER.error("{}  can not parse request", reqctx))
+        .doOnError(x -> LOGGER.error("{}  can not parse request", reqCtx))
         .map(query -> {
-            QueryParams qp = QueryParams.fromQuery(query, exchange.getResponse().bufferFactory(), bufferSize);
-            LOGGER.debug("{}  queryMergedLocal  {}  {}  {}", reqctx, qp.begin, qp.end, qp.channels);
+            QueryParams qp = QueryParams.fromQuery(query, reqCtx.bufCtx.bufFac, reqCtx.bufCtx.bufferSize);
+            LOGGER.info("{}  queryMergedLocal  {}  {}  {}  {}", reqCtx, qp.begin, qp.end, qp.channels, qp.splits);
             Instant begin = Instant.parse(query.range.startDate);
             Instant end = Instant.parse(query.range.endDate);
             long endNanos = 1000000L * end.toEpochMilli();
-            Flux<Mono<Flux<EventBlobMapResult>>> fcmf = Flux.fromIterable(query.channels)
-            .map(channelName -> {
-                Flux<Mono<Flux<Item>>> fmf = Flux.fromIterable(splitNodes)
-                .filter(sn -> qp.splits == null || qp.splits.isEmpty() || qp.splits.contains(sn.split))
-                .map(sn -> {
-                    LOGGER.debug("{}  local split {}", reqctx, sn.split);
-                    Query subq = new Query();
-                    subq.decompressOnServer = 0;
-                    subq.bufferSize = qp.bufferSize;
-                    subq.channels = List.of(channelName);
-                    subq.range = query.range;
-                    subq.splits = List.of(sn.split);
-                    Function<KeyspaceToDataParams, Mono<List<Flux<DataBuffer>>>> keyspaceToData = p -> {
-                        return ChannelEventStream.dataFluxFromFiles(p, new MakeTrans2());
+            return Flux.fromIterable(query.channels)
+            .concatMap(channelName -> {
+                return Flux.fromIterable(conf.splits)
+                .filter(split -> qp.splits == null || qp.splits.isEmpty() || qp.splits.contains(split))
+                .<Flux<MapTsItemVec>>map(split -> {
+                    LOGGER.info("{}  local {}  split {}  {}", reqCtx, conf.canonicalHostname, split, channelName);
+                    Function<KeyspaceToDataParams, Mono<List<Flux<BufCont>>>> keyspaceToData = p -> {
+                        return ChannelEventStream.dataFluxFromFiles(p, new MakeTrans2(), reqCtx.bufCtx);
                     };
-                    Flux<DataBuffer> fbuf = channelsToData(reqctx, exchange, baseDirFinder, subq.channels, qp.begin, qp.end, subq.splits, qp.bufFac, qp.bufferSize, keyspaceToData)
-                    .doOnDiscard(DataBuffer.class, DataBufferUtils::release);
-                    Flux<Item> flItem = EventBlobToV1MapTs.trans2(reqctx, EventBlobToV1MapTs.Mock.NONE, fbuf, String.format("__sn%02d__QML", sn.split), channelName, endNanos, qp.bufFac, qp.bufferSize);
-                    return Mono.just(flItem);
-                    /*
-                    return logMono(String.format("merged_sn%02d_ts_mono_sub", sn.split), req, m3);
-                    */
-                });
-                Flux<Mono<Flux<Item>>> fmf2 = logFlux(reqctx, "merged_ts_flux_subs", fmf);
-                Mono<Flux<EventBlobMapResult>> fl4 = fmf2.concatMap(Function.identity(), 1)
-                .map(fl -> fl.doOnDiscard(DataBuffer.class, DataBufferUtils::release))
+                    return channelsToData(reqCtx, baseDirFinder, List.of(channelName), qp.begin, qp.end, List.of(split), reqCtx.bufCtx, keyspaceToData)
+                    .transform(fl -> EventBlobToV1MapTs.trans(reqCtx, fl, String.format("__sn%02d__QML", split), channelName, endNanos, reqCtx.bufCtx));
+                })
                 .collectList()
-                .map(lfl -> Flux.from(new Merger(reqctx, channelName, lfl, qp.bufFac, qp.bufferSize)))
-                .map(flbuf -> {
-                    return EventBlobToV1Map.trans2(reqctx, flbuf, channelName, endNanos, qp.bufFac, qp.bufferSize, qp.decompressOnServer, qp.limitBytes)
-                    .doOnNext(x2 -> {
-                        if (x2.term) {
-                            LOGGER.warn("{}  EventBlobToV1Map reached TERM", reqctx);
-                        }
-                    })
-                    .takeWhile(x2 -> !x2.term);
-                });
-                return fl4;
-            });
-            return fcmf.<Flux<EventBlobMapResult>>concatMap(x -> x, 1)
-            .<EventBlobMapResult>concatMap(x -> x, 1)
-            .<DataBuffer>map(x -> x.buf)
-            .doOnNext(buf -> reqctx.addBodyLen(buf))
-            .doOnTerminate(() -> {
-                requestStatusBoard.bodyEmitted(reqctx);
-                LOGGER.info("RequestStatus bodyEmitted summary {}", requestStatusBoard.getOrCreate(reqctx).summary());
-            });
+                .<BufCont>flatMapMany(lfl -> pipeThroughMerger(reqCtx, lfl, channelName, qp, reqCtx.bufCtx))
+                .transform(flbuf -> EventBlobToV1Map.trans(reqCtx, flbuf, channelName, endNanos, qp.bufFac, qp.bufferSize, qp))
+                .concatMapIterable(EventBlobMapResult::takeBufCont, 4)
+                .transform(doDiscard("queryMergedOctetsLocalChannelEnd"));
+            }, 1)
+            .map(BufCont::takeBuf)
+            .filter(Optional::isPresent)
+            .map(Optional::get)
+            .doOnNext(k -> {
+                int rb = k.readableByteCount();
+                QueryData.totalBytesEmitted.getAndAdd(rb);
+                reqCtx.addBodyLen(rb);
+            })
+            .transform(fl -> Throttle.throttle(fl, qp.throttleRate, qp.throttleSteps, qp.throttleInterval, qp.throttleOverslack))
+            .transform(statusPing(reqCtx, this))
+            .transform(doDiscard("queryMergedOctetsLocalEnd"))
+            .doFinally(sig -> requestStatusBoard.bodyEmitted(reqCtx, sig));
         });
-        return logResponse(reqctx, "queryMergedLocal", mret);
+        return logResponse(reqCtx, "queryMergedOctetsLocal", mret);
     }
 
-    static class TransformSup3 implements TransformSupplier<MapJsonResult> {
-        QueryParams qp;
-        TransformSup3(QueryParams qp) {
-            this.qp = qp;
-        }
-        public Flux<MapJsonResult> trans3(Flux<DataBuffer> fl, String channelName) {
-            return EventBlobToJsonMap.trans2(fl, channelName, qp.endNanos, qp.bufFac, qp.bufferSize, qp.limitBytes);
-        }
-    }
 
-    public Mono<ResponseEntity<Flux<DataBuffer>>> queryMergedJson(ReqCtx reqctx, ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        requestStatusBoard.requestBegin(reqctx);
+    public Mono<ResponseEntity<Flux<DataBuffer>>> queryMergedJson(ReqCtx reqCtx, ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
+        requestStatusBoard.requestBegin(reqCtx);
         ServerHttpRequest req = exchange.getRequest();
         if (!req.getHeaders().getAccept().contains(MediaType.APPLICATION_JSON)) {
             LOGGER.warn("{}  queryMerged  Client omits Accept: {}", req.getId(), MediaType.APPLICATION_JSON);
-            //throw new RuntimeException("Incompatible Accept header");
         }
         Mono<Flux<DataBuffer>> mret = queryMono
         .doOnError(x -> LOGGER.info("can not parse request"))
@@ -765,82 +490,149 @@ public class QueryData {
                 binFind = null;
                 aggs = null;
             }
-            QueryParams qp = QueryParams.fromQuery(query, defaultDataBufferFactory, bufferSize);
+            QueryParams qp = QueryParams.fromQuery(query, reqCtx.bufCtx.bufFac, reqCtx.bufCtx.bufferSize);
             LOGGER.info(String.format("%s  queryMerged  %s  %s  %s", req.getId(), qp.begin, qp.end, qp.channels));
             AggMapper mapper = new AggMapper(binFind, aggs, qp.bufFac);
-            return buildMerged(reqctx, qp, new TransformSup3(qp))
+            return SubTools.buildMerged(reqCtx, qp, new TransformSup3(qp), new MergeFunctionDefault(), requestStatusBoard(), conf)
             .map(mapper::map)
             .concatWith(Mono.defer(() -> Mono.just(mapper.finalResult())))
             .concatMapIterable(Function.identity(), 1)
-            .doOnNext(buf -> {
-                reqctx.addBodyLen(buf);
-                totalBytesServed.getAndAdd(buf.readableByteCount());
+            .doFinally(k -> mapper.release())
+            .doOnNext(k -> {
+                int rb = k.readableByteCount();
+                QueryData.totalBytesEmitted.getAndAdd(rb);
+                reqCtx.addBodyLen(rb);
             })
-            .doOnTerminate(() -> {
-                mapper.release();
-                requestStatusBoard.bodyEmitted(reqctx);
-                LOGGER.info("RequestStatus bodyEmitted summary {}", requestStatusBoard.getOrCreate(reqctx).summary());
-            });
+            .transform(fl -> Throttle.throttle(fl, qp.throttleRate, qp.throttleSteps, qp.throttleInterval, qp.throttleOverslack))
+            .transform(statusPing(reqCtx, this))
+            .doFinally(sig -> requestStatusBoard.bodyEmitted(reqCtx, sig));
         });
-        return logMono(reqctx, "queryMergedJson", mret.map(x -> {
+        return mret.map(x -> {
             return ResponseEntity.ok()
-            .header("X-CanonicalHostname", canonicalHostname)
+            .header(HEADER_X_CANONICALHOSTNAME, conf.canonicalHostname)
+            .header(HEADER_X_DAQBUFFER_REQUEST_ID, reqCtx.reqId)
             .contentType(MediaType.APPLICATION_JSON)
             .body(x);
-        }));
-    }
-
-    static <T> Mono<T> logMono(ReqCtx reqctx, String name, Mono<T> m) {
-        if (true) return m;
-        return m
-        .doOnSuccess(x -> {
-            LOGGER.debug("{}  success  {}", reqctx, name);
-        })
-        .doOnCancel(() -> {
-            LOGGER.info("{}  cancel  {}", reqctx, name);
-        })
-        .doOnError(e -> {
-            LOGGER.error("{}  error  {}  {}", reqctx, name, e.toString());
-        })
-        .doOnTerminate(() -> {
-            LOGGER.debug("{}  terminate  {}", reqctx, name);
         });
     }
 
-    static <T> Flux<T> logFlux(ReqCtx reqctx, String name, Flux<T> m) {
-        if (true) return m;
-        return m
-        .doOnComplete(() -> {
-            LOGGER.debug("{}  complete  {}", reqctx, name);
-        })
-        .doOnCancel(() -> {
-            LOGGER.info("{}  cancel  {}", reqctx, name);
-        })
-        .doOnError(e -> {
-            LOGGER.error("{}  error  {}  {}", reqctx, name, e.toString());
-        })
-        .doOnTerminate(() -> {
-            LOGGER.debug("{}  terminate  {}", reqctx, name);
-        });
-    }
-
-    <T> Mono<ResponseEntity<Flux<T>>> logResponse(ReqCtx reqctx, String name, Mono<Flux<T>> m) {
-        return logMono(reqctx, name, m.map(x -> {
+    <T> Mono<ResponseEntity<Flux<T>>> logResponse(ReqCtx reqCtx, String name, Mono<Flux<T>> m) {
+        return m.map(fl -> {
             return ResponseEntity.ok()
-            .header("X-CanonicalHostname", canonicalHostname)
-            .header("x-daqbuffer-request-id", reqctx.reqId)
+            .header(HEADER_X_CANONICALHOSTNAME, conf.canonicalHostname)
+            .header(HEADER_X_DAQBUFFER_REQUEST_ID, reqCtx.reqId)
             .contentType(MediaType.APPLICATION_OCTET_STREAM)
-            .body(x);
-        }));
+            .body(fl);
+        });
     }
 
-    static Scheduler fs = Schedulers.newParallel("fs", 1);
+    public static <T> Function<Flux<T>, Flux<T>> doDiscard(String id) {
+        return fl -> fl.doOnDiscard(Object.class, obj -> doDiscard(id, obj));
+    }
 
-    <T> Flux<T> channelsToData(ReqCtx reqctx, ServerWebExchange exchange, BaseDirFinderFormatV0 baseDirFinder, List<String> channels, Instant begin, Instant end, List<Integer> splits, DataBufferFactory bufFac, int bufferSize, Function<KeyspaceToDataParams, Mono<List<Flux<T>>>> keyspaceToData) {
-        Flux<T> ret = Flux.fromIterable(channels)
+    public static <T> Function<Mono<T>, Mono<T>> doDiscardMono(String id) {
+        return fl -> fl.doOnDiscard(Object.class, obj -> doDiscard(id, obj));
+    }
+
+    public static void doDiscard(String id, Object obj) {
+        if (obj instanceof BufCont) {
+            // TODO count these cases
+            //LOGGER.info("doDiscard  {}  BufCont", id);
+            ((BufCont) obj).close();
+        }
+        else if (obj instanceof MapTsItemVec) {
+            //LOGGER.info("doDiscard  {}  MapTsItemVec", id);
+            ((MapTsItemVec) obj).release();
+        }
+        else if (obj instanceof MapTsToken) {
+            //LOGGER.info("doDiscard  {}  MapTsToken", id);
+            ((MapTsToken) obj).release();
+        }
+        else if (obj instanceof EventBlobMapResult) {
+            //LOGGER.info("doDiscard  {}  EventBlobMapResult", id);
+            ((EventBlobMapResult) obj).release();
+        }
+        else if (obj instanceof PositionedDatafile) {
+            try {
+                ((PositionedDatafile) obj).release();
+            }
+            catch (Throwable e) {
+                LOGGER.warn("exception while discard {}", e.toString());
+            }
+        }
+        else if (obj instanceof Releasable) {
+            //LOGGER.info("doDiscard  {}  Releasable  {}", id, obj.getClass().getSimpleName());
+            ((Releasable) obj).releaseFinite();
+        }
+        else if (obj instanceof Optional) {
+            Optional opt = (Optional) obj;
+            if (opt.isPresent()) {
+                String sn = opt.get().getClass().getSimpleName();
+                if (sn.equals("MonoOnAssembly")) {
+                }
+                else {
+                    LOGGER.info("doDiscard  {}  Optional  {}", id, sn);
+                }
+            }
+        }
+        else if (obj instanceof NettyDataBuffer) {
+        }
+        else if (obj instanceof LimitedDataBufferList) {
+        }
+        else if (obj instanceof Integer) {
+        }
+        else if (obj instanceof String) {
+        }
+        else if (obj instanceof TimeBin2) {
+        }
+        else if (obj != null) {
+            LOGGER.error("doDiscard  {}  UNKNOWN  {}", id, obj.getClass().getSimpleName());
+        }
+        else {
+            LOGGER.error("doDiscard  {}  null", id);
+        }
+    }
+
+    public static void doDiscardFinal(Object obj) {
+        if (obj instanceof DataBuffer) {
+            //LOGGER.info("doDiscard  {}  DataBuffer", id);
+            DataBufferUtils.release((DataBuffer) obj);
+        }
+        else if (obj instanceof LimitedDataBufferList) {
+            LOGGER.info("doDiscard  LimitedDataBufferList");
+            ((LimitedDataBufferList) obj).releaseAndClear();
+        }
+    }
+
+    static class StatusPinger {
+        long tsLast;
+        StatusPinger(long tsLast) {
+            this.tsLast = tsLast;
+        }
+    }
+
+    static <T> Function<Flux<T>, Flux<T>> statusPing(ReqCtx reqCtx, QueryData queryData) {
+        StatusPinger p = new StatusPinger(System.nanoTime());
+        return fl -> fl.doOnNext(_x -> {
+            long ts = System.nanoTime();
+            if (ts - p.tsLast > 1000L * 1000 * 1000 * 5) {
+                p.tsLast = ts;
+                queryData.requestStatusBoard.ping(reqCtx);
+            }
+        });
+    }
+
+    static Scheduler fs = Schedulers.newParallel("fs", 16);
+
+    <T extends Releasable> Flux<T> channelsToData(ReqCtx reqCtx, BaseDirFinderFormatV0 baseDirFinder, List<String> channels, Instant begin, Instant end, List<Integer> splitsIn, BufCtx bufCtx, Function<KeyspaceToDataParams, Mono<List<Flux<T>>>> keyspaceToData) {
+        if (splitsIn == null) {
+            splitsIn = List.of();
+        }
+        List<Integer> splits = splitsIn;
+        return Flux.fromIterable(channels)
         .subscribeOn(fs)
         .concatMap(channelName -> {
-            Flux<T> bulk = baseDirFinder.findMatchingDataFiles(reqctx, channelName, begin, end, splits, bufFac)
+            return baseDirFinder.findMatchingDataFiles(reqCtx, channelName, begin, end, splits, bufCtx.bufFac)
             .doOnNext(x -> {
                 if (x.keyspaces.size() < 1) {
                     LOGGER.warn(String.format("no keyspace found for channel %s", channelName));
@@ -850,25 +642,28 @@ public class QueryData {
                 }
                 else {
                     if (false) {
-                        LOGGER.info("Channel {} using files: {}", channelName, x.keyspaces.get(0).splits.stream().map(sp -> sp.timeBins.size()).reduce(0, (a2, x2) -> a2 + x2));
+                        LOGGER.info("Channel {} using files: {}", channelName, x.keyspaces.get(0).splits.stream().map(sp -> sp.timeBins.size()).reduce(0, Integer::sum));
                     }
                 }
             })
             .flatMapIterable(x2 -> x2.keyspaces)
-            .concatMap(ks -> keyspaceToData.apply(new KeyspaceToDataParams(reqctx, ks, begin, end, bufFac, bufferSize, splits, exchange.getRequest())), 1)
+            .concatMap(ks -> {
+                KeyspaceToDataParams p = new KeyspaceToDataParams(reqCtx, ks, begin, end, bufCtx.bufFac, bufCtx.bufferSize, splits);
+                return keyspaceToData.apply(p);
+            }, 0)
             .concatMap(x -> {
                 if (x.size() <= 0) {
                     throw new RuntimeException("logic");
                 }
                 if (x.size() > 1) {
+                    LOGGER.error("x.size() > 1   {}", x.size());
                     throw new RuntimeException("not yet supported in local query");
                 }
                 return x.get(0);
-            }, 1);
-            return bulk;
-        }, 1);
-        Flux<T> ret2 = logFlux(reqctx, "channelsToData", ret);
-        return ret2;
+            }, 0)
+            .transform(doDiscard("channelsToDataA"));
+        }, 0)
+        .transform(doDiscard("channelsToDataB"));
     }
 
 }

@@ -1,8 +1,8 @@
 package ch.psi.daq.retrieval;
 
-import org.springframework.core.io.buffer.DataBuffer;
+import ch.psi.daq.retrieval.bytes.BufCont;
 import reactor.core.publisher.Flux;
 
 public interface MapFunctionFactory<T> {
-    Flux<T> makeTrans(Flux<DataBuffer> fl, KeyspaceToDataParams kspp, int fileno);
+    Flux<T> makeTrans(Flux<BufCont> fl, KeyspaceToDataParams kspp, int fileno);
 }

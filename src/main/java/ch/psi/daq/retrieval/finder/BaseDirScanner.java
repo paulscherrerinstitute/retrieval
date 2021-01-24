@@ -13,19 +13,16 @@ import reactor.util.function.Tuple2;
 import reactor.util.function.Tuples;
 
 import java.io.IOException;
-import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Instant;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class BaseDirScanner {
-    static final Logger LOGGER = (Logger) LoggerFactory.getLogger(BaseDirScanner.class);
+    static final Logger LOGGER = (Logger) LoggerFactory.getLogger(BaseDirScanner.class.getSimpleName());
     final CacheLRU<String, ScanDataFilesResult> cacheForChannel = new CacheLRU<>(1<<15);
     static final List<String> keyspaces = List.of("2", "3", "4");
     static final Pattern patternTimeBin = Pattern.compile("[0-9]{19}");
@@ -37,6 +34,7 @@ public class BaseDirScanner {
         return BaseDirFinderFormatV0.channelConfig(reqctx, channel, bufFac)
         .flatMap(x -> {
             if (x.isPresent()) {
+                LOGGER.info("{}  got config  {}", reqctx, channel);
                 ChannelConfig conf = x.get();
                 ScanDataFilesResult res = new ScanDataFilesResult();
                 res.channelName = channel.name;
@@ -82,12 +80,6 @@ public class BaseDirScanner {
                             }
                             res.keyspaces.add(ksp);
                         }
-                        else {
-                            if (!res.keyspaces.get(0).ksp.equals(String.format("%d", e1.ks))) {
-                                //LOGGER.warn("{}  !res.keyspaces.get(0).ksp.equals  i1: {}  {}  vs  {}", reqctx, i1, res.keyspaces.get(0).ksp, e1.ks);
-                                //throw new RuntimeException("logic");
-                            }
-                        }
                         LOGGER.trace("\nbeginMs: {}\ne1.ts:   {}\ntoMs:    {}", beginMs, e1.ts / 1000000, toMs);
                         long tsMs = (Math.max(beginMs, e1.ts / 1000000) / e1.bs) * e1.bs;
                         for (; tsMs < toMs; tsMs += e1.bs) {
@@ -115,7 +107,14 @@ public class BaseDirScanner {
                         }
                     }
                 }
-                LOGGER.debug("{}  summary  ks size {}  ksp {}  tb size {}", reqctx, res.keyspaces.size(), res.keyspaces.get(0).ksp, res.keyspaces.get(0).splits.get(0).timeBins.size());
+                LOGGER.debug("{}  summary  ks size {}", reqctx, res.keyspaces.size());
+                if (res.keyspaces.size() > 0) {
+                    LOGGER.debug("{}  summary  ks size {}  ksp {}", reqctx, res.keyspaces.size(), res.keyspaces.get(0).ksp);
+                    if (res.keyspaces.get(0).splits.size() > 0) {
+                        LOGGER.debug("{}  summary  ks size {}  ksp {}  tb size {}", reqctx, res.keyspaces.size(), res.keyspaces
+                        .get(0).ksp, res.keyspaces.get(0).splits.get(0).timeBins.size());
+                    }
+                }
                 return Mono.just(res);
             }
             else {

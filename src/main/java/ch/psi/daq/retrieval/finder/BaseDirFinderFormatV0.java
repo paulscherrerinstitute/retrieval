@@ -25,7 +25,7 @@ import java.util.stream.Collectors;
  * by databuffer, imagebuffer, ...
  */
 public class BaseDirFinderFormatV0 {
-    static final Logger LOGGER = LoggerFactory.getLogger(BaseDirFinderFormatV0.class);
+    static final Logger LOGGER = LoggerFactory.getLogger(BaseDirFinderFormatV0.class.getSimpleName());
     static final BaseDirScanner scanner = new BaseDirScanner();
     final Path baseDir;
     final String baseKeyspaceName;
@@ -63,11 +63,12 @@ public class BaseDirFinderFormatV0 {
         public List<KeyspaceOrder2> keyspaces;
     }
 
-    public Mono<MatchingDataFilesResult> findMatchingDataFiles(ReqCtx reqctx, String channelName, Instant begin, Instant end, List<Integer> splits, DataBufferFactory bufFac) {
+    public Mono<MatchingDataFilesResult> findMatchingDataFiles(ReqCtx reqCtx, String channelName, Instant begin, Instant end, List<Integer> splits, DataBufferFactory bufFac) {
+        //LOGGER.info("{}  findMatchingDataFiles  {}  {}  {}", reqCtx, channelName, begin, end);
         long beginMs = begin.toEpochMilli();
         long endMs = end.toEpochMilli();
         Channel channel = new Channel(new BaseDir(baseDir, baseKeyspaceName), channelName);
-        return scanDataFiles(reqctx, channel, beginMs, endMs, splits, bufFac)
+        return scanDataFiles(reqCtx, channel, beginMs, endMs, splits, bufFac)
         .map(res -> {
             List<KeyspaceOrder2> lKsp = res.keyspaces.stream()
             .map(ks -> {
@@ -75,16 +76,14 @@ public class BaseDirFinderFormatV0 {
                 .map(sp -> {
                     List<TimeBin2> lTb = sp.timeBins.stream()
                     //.peek(tb -> {
-                    //    LOGGER.debug("{}  candidate  channel {}  split {}  bin {}  binSize {}", reqctx, channel, sp.split, tb.timeBin, tb.binSize);
+                    //    LOGGER.debug("{}  candidate  channel {}  split {}  bin {}  binSize {}", reqCtx, channel, sp.split, tb.timeBin, tb.binSize);
                     //})
                     .filter(tb -> {
                         long beg = tb.timeBin * tb.binSize;
                         boolean pr = beg < endMs && (beg + tb.binSize > beginMs);
                         return pr;
                     })
-                    .peek(tb -> {
-                        LOGGER.debug("{}  chosen  channel {}  split {}  bin {}  binSize {}", reqctx, channel, sp.split, tb.timeBin, tb.binSize);
-                    })
+                    //.peek(tb -> LOGGER.debug("{}  chosen  channel {}  split {}  bin {}  binSize {}", reqCtx, channel, sp.split, tb.timeBin, tb.binSize))
                     .collect(Collectors.toList());
                     Split sp2 = new Split(sp.split);
                     sp2.timeBins = lTb;
@@ -111,47 +110,53 @@ public class BaseDirFinderFormatV0 {
         });
     }
 
-    public Mono<ScanDataFilesResult> scanDataFiles(ReqCtx reqctx, Channel channel, long beginMs, long endMs, List<Integer> splits, DataBufferFactory bufFac) {
-        return scanner.getChannelScan(reqctx, channel, beginMs, endMs, splits, bufFac);
+    public Mono<ScanDataFilesResult> scanDataFiles(ReqCtx reqCtx, Channel channel, long beginMs, long endMs, List<Integer> splits, DataBufferFactory bufFac) {
+        return scanner.getChannelScan(reqCtx, channel, beginMs, endMs, splits, bufFac);
     }
 
-    public static Mono<Optional<ChannelConfig>> channelConfig(ReqCtx reqctx, Channel channel, DataBufferFactory bufFac) {
+    public static Mono<Optional<ChannelConfig>> channelConfig(ReqCtx reqCtx, Channel channel, DataBufferFactory bufFac) {
         long tsBeg = System.nanoTime();
         Path path = Path.of(String.format("%s/config/%s/latest/00000_Config", channel.base.baseDir, channel.name));
+        if (!Files.exists(path)) {
+            return Mono.just(Optional.empty());
+        }
         Flux<DataBuffer> fb = DataBufferUtils.readByteChannel(() -> {
             try {
                 return Files.newByteChannel(path);
             }
             catch (IOException e) {
-                LOGGER.warn("{}  can not open {}", reqctx, path);
+                LOGGER.info("{}  existed but can not open config {}  {}", reqCtx, channel.name, path);
                 throw new RuntimeException(e);
             }
         }, bufFac, 512 * 1024);
         return DataBufferUtils.join(fb, 1<<21)
         .map(Optional::of)
-        .onErrorReturn(Optional.empty())
+        .onErrorResume(e -> {
+            LOGGER.info("{}  could not find config for {}  {}", reqCtx, channel, e.toString());
+            return Mono.just(Optional.empty());
+        })
         .map(x -> {
             if (x.isEmpty()) {
-                LOGGER.warn("{}  could not read config for {}", reqctx, path);
+                LOGGER.warn("{}  could not read config for {}  {}", reqCtx, channel.name, path);
                 return Optional.empty();
             }
             DataBuffer buf = x.get();
             ByteBuffer bbuf = buf.asByteBuffer(buf.readPosition(), buf.readableByteCount());
             short vser = bbuf.getShort();
             if (vser != 0) {
-                LOGGER.error("{}  bad config ser {} {}", reqctx, channel.name, vser);
+                LOGGER.error("{}  bad config ser {} {}", reqCtx, channel.name, vser);
                 throw new RuntimeException("logic error");
             }
             int channelNameLength1 = bbuf.getInt();
-            if (channelNameLength1 < 8) {
-                LOGGER.error("{}  channel name bad  {}  {}", reqctx, channel.name, channelNameLength1);
+            if (channelNameLength1 < 8 || channelNameLength1 > 256) {
+                LOGGER.error("{}  channel name bad  {}  {}", reqCtx, channel.name, channelNameLength1);
                 throw new RuntimeException("logic");
             }
             channelNameLength1 -= 8;
             StandardCharsets.UTF_8.decode(bbuf.slice().limit(channelNameLength1));
             bbuf.position(bbuf.position() + channelNameLength1);
             if (bbuf.getInt() != channelNameLength1 + 8) {
-                LOGGER.error("{}  channel name bad  {}", reqctx, channelNameLength1);
+                LOGGER.error("{}  channel name bad  {}", reqCtx, channelNameLength1);
                 throw new RuntimeException("logic");
             }
             ChannelConfig conf = new ChannelConfig();
@@ -159,7 +164,7 @@ public class BaseDirFinderFormatV0 {
                 int p1 = bbuf.position();
                 int len1 = bbuf.getInt();
                 if (len1 < 32 || len1 > 1024) {
-                    LOGGER.error("{}  bad config entry len  {}", reqctx, len1);
+                    LOGGER.error("{}  bad config entry len  {}", reqCtx, len1);
                     throw new RuntimeException("logic");
                 }
                 if (bbuf.remaining() < len1 - Integer.BYTES) {
@@ -171,7 +176,7 @@ public class BaseDirFinderFormatV0 {
                 int ks = bbuf.getInt();
                 long bs = bbuf.getLong();
                 int sc = bbuf.getInt();
-                LOGGER.debug("{} found meta  ts {}  ks {}  bs {}  sc {}", reqctx, ts, ks, bs, sc);
+                LOGGER.debug("{} found meta  ts {}  ks {}  bs {}  sc {}", reqCtx, ts, ks, bs, sc);
                 ChannelConfigEntry e = new ChannelConfigEntry();
                 e.ts = ts;
                 e.ks = ks;
@@ -181,7 +186,7 @@ public class BaseDirFinderFormatV0 {
                 bbuf.position(p1 + len1);
             }
             DataBufferUtils.release(buf);
-            reqctx.addConfigParseDuration(System.nanoTime() - tsBeg);
+            reqCtx.addConfigParseDuration(System.nanoTime() - tsBeg);
             return Optional.of(conf);
         });
     }

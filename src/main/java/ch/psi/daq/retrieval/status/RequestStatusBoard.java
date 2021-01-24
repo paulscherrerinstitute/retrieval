@@ -3,6 +3,7 @@ package ch.psi.daq.retrieval.status;
 import ch.psi.daq.retrieval.ReqCtx;
 import ch.qos.logback.classic.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.publisher.SignalType;
 
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
@@ -10,9 +11,33 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class RequestStatusBoard {
-    static final Logger LOGGER = (Logger) LoggerFactory.getLogger(RequestStatusBoard.class);
+    static final Logger LOGGER = (Logger) LoggerFactory.getLogger(RequestStatusBoard.class.getSimpleName());
+    static final AtomicLong finallyCompleteCount = new AtomicLong();
+    static final AtomicLong finallyErrorCount = new AtomicLong();
+    static final AtomicLong finallyCancelCount = new AtomicLong();
+
+    public static class Stats {
+        public int entryCount;
+        public long finallyCompleteCount;
+        public long finallyErrorCount;
+        public long finallyCancelCount;
+        public Stats(RequestStatusBoard rsb) {
+            synchronized (rsb.map) {
+                entryCount = rsb.map.size();
+            }
+            finallyCompleteCount = RequestStatusBoard.finallyCompleteCount.get();
+            finallyErrorCount = RequestStatusBoard.finallyErrorCount.get();
+            finallyCancelCount = RequestStatusBoard.finallyCancelCount.get();
+        }
+    }
+
+    public Stats stats() {
+        return new Stats(this);
+    }
+
     Map<String, RequestStatus> map = new TreeMap<>();
 
     public synchronized RequestStatus get(String reqId) {
@@ -52,16 +77,30 @@ public class RequestStatusBoard {
         getOrCreate(reqctx).ping();
     }
 
-    public void bodyEmitted(ReqCtx reqctx) {
-        reqctx.bodyEmitted();
-        ping(reqctx);
+    public void bodyEmitted(ReqCtx reqCtx, SignalType sig) {
+        if (sig == SignalType.ON_COMPLETE) {
+            finallyCompleteCount.getAndAdd(1);
+        }
+        else if (sig == SignalType.ON_ERROR) {
+            finallyErrorCount.getAndAdd(1);
+        }
+        else if (sig == SignalType.CANCEL) {
+            finallyCancelCount.getAndAdd(1);
+        }
+        reqCtx.bodyEmitted();
+        ping(reqCtx);
+        LOGGER.info("RequestStatus bodyEmitted  sig {}  summary {}", sig, getOrCreate(reqCtx).summary());
+    }
+
+    public synchronized int mapCount() {
+        return map.size();
     }
 
     public synchronized long gc() {
-        return cleanGivenStatusLog(ZonedDateTime.now(ZoneOffset.UTC).minusSeconds(120), 10000);
+        return clean(ZonedDateTime.now(ZoneOffset.UTC).minusSeconds(120), 1000);
     }
 
-    public synchronized long cleanGivenStatusLog(ZonedDateTime keepTo, int keepMax) {
+    public synchronized long clean(ZonedDateTime keepTo, int keepMax) {
         List<ZonedDateTime> tss = new ArrayList<>();
         for (String k : map.keySet()) {
             RequestStatus s = map.get(k);

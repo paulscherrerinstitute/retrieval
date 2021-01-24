@@ -1,25 +1,35 @@
 package ch.psi.daq.retrieval.eventmap.ts;
 
-import ch.psi.daq.retrieval.PositionedDatafile;
+import ch.psi.daq.retrieval.BufCtx;
 import ch.psi.daq.retrieval.ReqCtx;
+import ch.psi.daq.retrieval.bytes.BufCont;
 import ch.qos.logback.classic.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.io.buffer.DataBuffer;
-import org.springframework.core.io.buffer.DataBufferFactory;
-import org.springframework.core.io.buffer.DataBufferUtils;
 import reactor.core.publisher.Flux;
-import reactor.core.publisher.Mono;
 
 import java.nio.ByteBuffer;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 
-public class EventBlobToV1MapTs implements Function<DataBuffer, Item> {
-    static Logger LOGGER = (Logger) LoggerFactory.getLogger("EventBlobToV1MapTs");
+import static ch.psi.daq.retrieval.controller.QueryData.doDiscard;
+
+public class EventBlobToV1MapTs implements Function<BufCont, MapTsItemVec> {
+    static final Logger LOGGER = (Logger) LoggerFactory.getLogger(EventBlobToV1MapTs.class.getSimpleName());
     static final int HEADER_A_LEN = 2 * Integer.BYTES + 4 * Long.BYTES + 2 * Byte.BYTES;
-    DataBufferFactory bufFac;
-    DataBuffer left;
-    int bufferSize;
-    int bufferSize2;
+    static final AtomicLong leftCopiedTimes = new AtomicLong();
+    static final AtomicLong leftCopiedBytes = new AtomicLong();
+    static final AtomicLong applyBufContEmpty = new AtomicLong();
+    static final AtomicLong applyDespiteTerm = new AtomicLong();
+    static final AtomicLong applyEmptyBuffer = new AtomicLong();
+    static final AtomicLong transInpDiscardCount = new AtomicLong();
+    static final AtomicLong openCount = new AtomicLong();
+    static final AtomicLong closeCount = new AtomicLong();
+    static final AtomicLong retainLeftCount = new AtomicLong();
+    static final AtomicLong inpCount = new AtomicLong();
+    static final AtomicLong inpBytes = new AtomicLong();
+    static final AtomicLong leftWithoutBuf = new AtomicLong();
+    BufCont leftbufcont;
     State state;
     int needMin;
     int missingBytes;
@@ -29,13 +39,15 @@ public class EventBlobToV1MapTs implements Function<DataBuffer, Item> {
     int headerLength;
     int optionalFieldsLength;
     long endNanos;
-    Item item;
-    ItemP itemP;
-    int maxItemElements;
+    int markBeg;
+    int inside;
+    int bufBeg;
     String name;
-    int termApplyCount;
-    long itemCount;
     ReqCtx reqctx;
+    boolean closed;
+    boolean detectedUnordered;
+    long tsLast = Long.MIN_VALUE;
+    long pulseLast = Long.MIN_VALUE;
 
     enum State {
         EXPECT_HEADER_A,
@@ -44,206 +56,104 @@ public class EventBlobToV1MapTs implements Function<DataBuffer, Item> {
         TERM,
     }
 
-    public enum Mock {
-        NONE,
-        DUMMY_ITEM,
-        CHAIN_BUT_DUMMY,
-    }
-
-    public EventBlobToV1MapTs(ReqCtx reqctx, String name, long endNanos, DataBufferFactory bufferFactory, int bufferSize) {
+    public EventBlobToV1MapTs(ReqCtx reqctx, String name, long endNanos, BufCtx bufctx) {
+        openCount.getAndAdd(1);
         this.reqctx = reqctx;
         this.name = name;
-        this.bufFac = bufferFactory;
-        this.bufferSize = bufferSize;
-        this.bufferSize2 = 2 * bufferSize;
         this.endNanos = endNanos;
-        this.maxItemElements = 4;
         this.state = State.EXPECT_HEADER_A;
         this.needMin = HEADER_A_LEN;
     }
 
-    public static Flux<Item> trans2(ReqCtx reqctx, Mock mock, Flux<DataBuffer> fl, String name, String channelName, long endNanos, DataBufferFactory bufFac, int bufferSize) {
-        if (mock == Mock.DUMMY_ITEM) {
-            return fl
-            .doOnNext(DataBufferUtils::release)
-            .map(buf -> Item.dummy(bufFac));
+    public static class Stats {
+        public long leftCopiedTimes;
+        public long leftCopiedBytes;
+        public long applyBufContEmpty;
+        public long applyDespiteTerm;
+        public long applyEmptyBuffer;
+        public long transInpDiscardCount;
+        public long openCount;
+        public long closeCount;
+        public long retainLeftCount;
+        public long inpCount;
+        public long inpBytes;
+        public long leftWithoutBuf;
+        public Stats() {
+            leftCopiedTimes = EventBlobToV1MapTs.leftCopiedTimes.get();
+            leftCopiedBytes = EventBlobToV1MapTs.leftCopiedBytes.get();
+            applyBufContEmpty = EventBlobToV1MapTs.applyBufContEmpty.get();
+            applyDespiteTerm = EventBlobToV1MapTs.applyDespiteTerm.get();
+            applyEmptyBuffer = EventBlobToV1MapTs.applyEmptyBuffer.get();
+            transInpDiscardCount = EventBlobToV1MapTs.transInpDiscardCount.get();
+            openCount = EventBlobToV1MapTs.openCount.get();
+            closeCount = EventBlobToV1MapTs.closeCount.get();
+            retainLeftCount = EventBlobToV1MapTs.retainLeftCount.get();
+            inpCount = EventBlobToV1MapTs.inpCount.get();
+            inpBytes = EventBlobToV1MapTs.inpBytes.get();
+            leftWithoutBuf = EventBlobToV1MapTs.leftWithoutBuf.get();
         }
+    }
 
-        EventBlobToV1MapTs mapper;
-        mapper = new EventBlobToV1MapTs(reqctx, name, endNanos, bufFac, bufferSize);
+    public static Flux<MapTsItemVec> trans(ReqCtx reqctx, Flux<BufCont> fl, String name, String channelName, long endNanos, BufCtx bufctx) {
+        final EventBlobToV1MapTs mapper = new EventBlobToV1MapTs(reqctx, name, endNanos, bufctx);
         return fl
-        .doOnDiscard(Object.class, obj -> {
-            if (obj == null) {
-                LOGGER.error("{}  null obj in ed1ee40c", reqctx);
-            }
-            else if (obj instanceof DataBuffer) {
-                LOGGER.info("{}  DataBuffer in ed1ee40c {}", reqctx, obj.getClass().getName());
-                DataBufferUtils.release((DataBuffer) obj);
-            }
-            else if (obj instanceof PositionedDatafile) {
-                LOGGER.info("{}  PositionedDatafile in ed1ee40c {}", reqctx, obj.getClass().getName());
-                PositionedDatafile item = (PositionedDatafile) obj;
-                item.release();
-            }
-            else {
-                LOGGER.error("{}  Class in ed1ee40c {}", reqctx, obj.getClass().getName());
-            }
-        })
-        .map(buf -> {
-            if (mock == Mock.CHAIN_BUT_DUMMY) {
-                DataBufferUtils.release(buf);
-                return Item.dummy(bufFac);
-            }
-            else {
-                try {
-                    return mapper.apply(buf);
-                }
-                catch (Throwable e) {
-                    LOGGER.error("{}  Mapper failure {}", reqctx, e.toString());
-                    throw new RuntimeException(e);
-                }
-            }
-        })
-        .concatWith(Mono.defer(() -> {
-            try {
-                if (mock == Mock.CHAIN_BUT_DUMMY) {
-                    Item item = Item.dummy(bufFac);
-                    item.isLast = true;
-                    return Mono.just(item);
-                }
-                else {
-                    Item item = mapper.lastResult();
-                    if (item == null) {
-                        LOGGER.error("{}  lastResult is null  name {}", reqctx, name);
-                        return Mono.just(Item.dummy(bufFac));
-                    }
-                    else {
-                        return Mono.just(item);
-                    }
-                }
-            }
-            catch (Throwable e) {
-                LOGGER.error("{}  lastResult error  name {}  {}", reqctx, name, e.toString());
-                throw new RuntimeException(e);
-            }
-        }))
-        .doOnTerminate(() -> mapper.release());
+        .doOnDiscard(BufCont.class, BufCont::close)
+        .map(mapper)
+        .doFinally(k -> mapper.release())
+        .transform(doDiscard("EventBlobToV1MapTsTrans"))
+        .doOnNext(obj -> obj.markWith(BufCont.Mark.MapTs_trans2));
     }
 
     @Override
-    public Item apply(DataBuffer buf) {
-        if (buf.readableByteCount() == 0) {
-            LOGGER.debug("{}  empty byte buffer received  {}", reqctx, name);
+    public synchronized MapTsItemVec apply(BufCont bufcont) {
+        if (bufcont.isEmpty()) {
+            applyBufContEmpty.getAndAdd(1);
+            bufcont.close();
+            return MapTsItemVec.empty();
         }
-        LOGGER.trace("{}  {}  apply  buf rp {}  buf wp {}  buf n {}", reqctx, name, buf.readPosition(), buf.writePosition(), buf.readableByteCount());
+        final DataBuffer buf = bufcont.bufferRef();
         if (state == State.TERM) {
-            if (termApplyCount == 0) {
-                LOGGER.trace("{}  {}  apply buffer despite TERM  c: {}", reqctx, name, termApplyCount);
-            }
-            else {
-                LOGGER.warn("{}  {}  apply buffer despite TERM  c: {}", reqctx, name, termApplyCount);
-            }
-            termApplyCount += 1;
-            DataBufferUtils.release(buf);
-            item = new Item();
-            itemCount += 1;
-            item.term = true;
-            return item;
+            applyDespiteTerm.getAndAdd(1);
+            bufcont.close();
+            return MapTsItemVec.term();
         }
         else {
-            Item ret = apply2(buf);
-            LOGGER.trace("{}  {}  return Item  has item1 {}", reqctx, name, ret.item1 != null);
+            if (buf.readableByteCount() == 0) {
+                applyEmptyBuffer.getAndAdd(1);
+            }
+            inpCount.getAndAdd(1);
+            inpBytes.getAndAdd(buf.readableByteCount());
+            MapTsItemVec ret = applyInner(bufcont);
+            ret.markWith(BufCont.Mark.MapTs_apply);
             return ret;
         }
     }
 
-    public Item apply2(DataBuffer buf) {
-        if (left == null) {
-            item = new Item();
-            itemCount += 1;
-            item.item1 = new ItemP();
-            itemP = item.item1;
-            itemP.c = 0;
-            itemP.ts = new long[maxItemElements];
-            itemP.pos = new int[maxItemElements];
-            itemP.ty = new int[maxItemElements];
-            itemP.len = new int[maxItemElements];
-            itemP.buf = buf;
-            itemP.p1 = buf.readPosition();
+    MapTsItemVec applyInner(BufCont bufcont) {
+        MapTsItemVec ret = MapTsItemVec.empty();
+        DataBuffer buf = bufcont.bufferRef();
+        if (leftbufcont != null && !leftbufcont.hasBuf()) {
+            leftWithoutBuf.getAndAdd(1);
+            leftbufcont.close();
+            leftbufcont = null;
         }
-        else {
-            item = new Item();
-            itemCount += 1;
-            if (needMin <= 0) {
-                throw new RuntimeException("logic");
-            }
-            if (left.readableByteCount() <= 0) {
-                throw new RuntimeException("logic");
-            }
-            if (left.readableByteCount() >= needMin) {
-                throw new RuntimeException("logic");
-            }
-            int n = Math.min(buf.readableByteCount(), needMin - left.readableByteCount());
-            int l1 = buf.readableByteCount();
-            int l2 = left.readableByteCount();
-            left.write(buf.slice(buf.readPosition(), n));
-            buf.readPosition(buf.readPosition() + n);
-            if (buf.readableByteCount() + n != l1) {
-                throw new RuntimeException("logic");
-            }
-            if (left.readableByteCount() != l2 + n) {
-                throw new RuntimeException("logic");
-            }
-            if (left.readableByteCount() >= needMin) {
-                itemP = new ItemP();
-                item.item1 = itemP;
-                itemP.c = 0;
-                itemP.ts = new long[maxItemElements];
-                itemP.pos = new int[maxItemElements];
-                itemP.ty = new int[maxItemElements];
-                itemP.len = new int[maxItemElements];
-                itemP.p1 = left.readPosition();
-                parse(left);
-                if (left.readableByteCount() != 0) {
-                    throw new RuntimeException("logic");
-                }
-                itemP.p2 = left.readPosition();
-                itemP.buf = left;
-                left = null;
-                itemP.buf.readPosition(itemP.p1);
-                itemP.buf.writePosition(itemP.p2);
-                itemP = new ItemP();
-                item.item2 = itemP;
-                itemP.c = 0;
-                itemP.ts = new long[maxItemElements];
-                itemP.pos = new int[maxItemElements];
-                itemP.ty = new int[maxItemElements];
-                itemP.len = new int[maxItemElements];
-                itemP.p1 = buf.readPosition();
+        if (leftbufcont != null && leftbufcont.hasBuf()) {
+            applyLeft(buf, ret);
+        }
+        markBeg = -1;
+        bufBeg = buf.readPosition();
+        ret.bufferBegin(bufcont);
+        while (state != State.TERM && buf.readableByteCount() > 0 && buf.readableByteCount() >= needMin) {
+            parse(buf, ret);
+        }
+        int bufEnd = buf.readPosition();
+        if (inside == 1) {
+            if (markBeg >= 0) {
+                ret.add(markBeg, bufEnd - markBeg, ts, MapTsItemVec.Ty.OPEN);
             }
             else {
-                if (buf.readableByteCount() != 0) {
-                    throw new RuntimeException("logic");
-                }
-                itemP = new ItemP();
-                item.item1 = itemP;
-                itemP.c = 0;
-                itemP.ts = new long[maxItemElements];
-                itemP.pos = new int[maxItemElements];
-                itemP.ty = new int[maxItemElements];
-                itemP.len = new int[maxItemElements];
-                itemP.p1 = buf.readPosition();
-                itemP.p2 = buf.readPosition();
+                ret.add(bufBeg, bufEnd - bufBeg, ts, MapTsItemVec.Ty.MIDDLE);
             }
-        }
-        while (true) {
-            if (state == State.TERM) {
-                break;
-            }
-            if (buf.readableByteCount() == 0 || buf.readableByteCount() < needMin) {
-                break;
-            }
-            parse(buf);
         }
         if (state != State.TERM && buf.readableByteCount() > 0) {
             if (needMin <= 0) {
@@ -252,37 +162,75 @@ public class EventBlobToV1MapTs implements Function<DataBuffer, Item> {
             if (buf.readableByteCount() >= needMin) {
                 throw new RuntimeException("logic");
             }
-            itemP.p2 = buf.readPosition();
-            left = bufFac.allocateBuffer(bufferSize2);
-            left.write(buf.slice(buf.readPosition(), buf.readableByteCount()));
-            buf.readPosition(buf.writePosition());
-            itemP.buf = buf;
-            itemP.buf.readPosition(itemP.p1);
-            itemP.buf.writePosition(itemP.p2);
+            leftbufcont = BufCont.allocate(buf.factory(), 1024, BufCont.Mark.MapTs_keep_left);
+            DataBuffer left = leftbufcont.bufferRef();
+            left.write(buf);
         }
-        else {
-            itemP.p2 = buf.readPosition();
-            itemP.buf = buf;
-            itemP.buf.readPosition(itemP.p1);
-            itemP.buf.writePosition(itemP.p2);
-        }
-        Item ret = item;
-        item = null;
+        buf.readPosition(bufBeg);
+        buf.writePosition(bufEnd);
+        bufcont.close();
         return ret;
     }
 
-    void parse(DataBuffer buf) {
-        if (buf == null) {
+    void applyLeft(DataBuffer buf, MapTsItemVec ret) {
+        DataBuffer left = leftbufcont.bufferRef();
+        if (needMin <= 0) {
             throw new RuntimeException("logic");
         }
+        if (left.readableByteCount() <= 0) {
+            throw new RuntimeException("logic");
+        }
+        if (left.readableByteCount() >= needMin) {
+            throw new RuntimeException("logic");
+        }
+        int n = Math.min(buf.readableByteCount(), needMin - left.readableByteCount());
+        int l1 = buf.readableByteCount();
+        int l2 = left.readableByteCount();
+        if (left.writableByteCount() < n) {
+            throw new RuntimeException("logic");
+        }
+        left.write(buf.slice(buf.readPosition(), n));
+        buf.readPosition(buf.readPosition() + n);
+        if (buf.readableByteCount() + n != l1) {
+            throw new RuntimeException("logic");
+        }
+        if (left.readableByteCount() != l2 + n) {
+            throw new RuntimeException("logic");
+        }
+        leftCopiedTimes.getAndAdd(1);
+        leftCopiedBytes.getAndAdd(n);
+        if (left.readableByteCount() >= needMin) {
+            markBeg = -1;
+            bufBeg = left.readPosition();
+            ret.bufferBegin(leftbufcont);
+            parse(left, ret);
+            if (left.readableByteCount() != 0) {
+                throw new RuntimeException("logic");
+            }
+            if (inside == 1) {
+                if (markBeg >= 0) {
+                    ret.add(markBeg, left.readPosition() - markBeg, ts, MapTsItemVec.Ty.OPEN);
+                }
+                else {
+                    ret.add(bufBeg, left.readPosition() - bufBeg, ts, MapTsItemVec.Ty.MIDDLE);
+                }
+            }
+            left.writePosition(left.readPosition());
+            left.readPosition(bufBeg);
+            leftbufcont.close();
+            leftbufcont = null;
+        }
+    }
+
+    void parse(DataBuffer buf, MapTsItemVec res) {
         if (state == State.EXPECT_HEADER_A) {
-            parseHeaderA(buf);
+            parseHeaderA(buf, res);
         }
         else if (state == State.EXPECT_BLOBS) {
             parseBlob(buf);
         }
         else if (state == State.EXPECT_SECOND_LENGTH) {
-            parseSecondLength(buf);
+            parseSecondLength(buf, res);
         }
         else if (state == State.TERM) {
         }
@@ -291,7 +239,7 @@ public class EventBlobToV1MapTs implements Function<DataBuffer, Item> {
         }
     }
 
-    void parseHeaderA(DataBuffer buf) {
+    void parseHeaderA(DataBuffer buf, MapTsItemVec res) {
         int bpos = buf.readPosition();
         ByteBuffer bb = buf.asByteBuffer(buf.readPosition(), needMin);
         buf.readPosition(buf.readPosition() + needMin);
@@ -312,14 +260,27 @@ public class EventBlobToV1MapTs implements Function<DataBuffer, Item> {
         long iocTime = bb.getLong();
         byte status = bb.get();
         byte severity = bb.get();
-        LOGGER.trace("{}  {}  seen  length  {}  timestamp {} {}  pulse {}", reqctx, name, length, ts / 1000000000L, ts % 1000000000, pulse);
+        LOGGER.debug("{}  {}  seen  length  {}  timestamp {} {}  pulse {}", reqctx, name, length, ts / 1000000000L, ts % 1000000000, pulse);
         if (ts >= endNanos) {
-            LOGGER.debug("{}  {}  ts >= endNanos  {} {}  >=  {} {}", reqctx, name, ts / 1000000000L, ts % 1000000000, endNanos / 1000000000L, endNanos % 1000000000);
+            LOGGER.info("{}  {}  ts >= endNanos  {} {}  >=  {} {}", reqctx, name, ts / 1000000000L, ts % 1000000000, endNanos / 1000000000L, endNanos % 1000000000);
             state = State.TERM;
             buf.readPosition(bpos);
             buf.writePosition(bpos);
             return;
         }
+        if (tsLast != Long.MIN_VALUE && ts < tsLast) {
+            if (!detectedUnordered) {
+                LOGGER.error("unordered ts  {}  {}  in {}", ts, tsLast, name);
+                detectedUnordered = true;
+            }
+        }
+        if (pulseLast != Long.MIN_VALUE && pulse < pulseLast) {
+            if (false) {
+                LOGGER.error("unordered pulse  {}  {}  in {}", pulse, pulseLast, name);
+            }
+        }
+        tsLast = ts;
+        pulseLast = pulse;
         int optionalFieldsLength = bb.getInt();
         if (optionalFieldsLength < -1 || optionalFieldsLength == 0) {
             LOGGER.error("{}  {}  unexpected value for optionalFieldsLength: {}", reqctx, name, optionalFieldsLength);
@@ -337,15 +298,11 @@ public class EventBlobToV1MapTs implements Function<DataBuffer, Item> {
         this.ts = ts;
         this.optionalFieldsLength = Math.max(optionalFieldsLength, 0);
         this.blobLength = length;
-        reallocItem();
-        itemP.ts[itemP.c] = ts;
-        itemP.pos[itemP.c] = bpos;
-        itemP.ty[itemP.c] = 1;
-        itemP.len[itemP.c] = this.blobLength;
-        itemP.c += 1;
         state = State.EXPECT_BLOBS;
         missingBytes = length - needMin - 4;
         needMin = 0;
+        inside = 1;
+        markBeg = bpos;
     }
 
     void parseBlob(DataBuffer buf) {
@@ -361,7 +318,7 @@ public class EventBlobToV1MapTs implements Function<DataBuffer, Item> {
         }
     }
 
-    void parseSecondLength(DataBuffer buf) {
+    void parseSecondLength(DataBuffer buf, MapTsItemVec res) {
         int bpos = buf.readPosition();
         ByteBuffer bb = buf.asByteBuffer(buf.readPosition(), needMin);
         buf.readPosition(buf.readPosition() + needMin);
@@ -376,52 +333,30 @@ public class EventBlobToV1MapTs implements Function<DataBuffer, Item> {
             LOGGER.error("{}  {}  event blob length mismatch at {}   {} vs {}", reqctx, name, buf.readPosition(), len2, blobLength);
             throw new RuntimeException("unexpected 2nd length");
         }
-        reallocItem();
-        itemP.ts[itemP.c] = ts;
-        itemP.pos[itemP.c] = bpos + 4;
-        itemP.ty[itemP.c] = 2;
-        itemP.len[itemP.c] = -1;
-        itemP.c += 1;
+        if (markBeg >= 0) {
+            res.add(markBeg, buf.readPosition() - markBeg, ts, MapTsItemVec.Ty.FULL);
+        }
+        else {
+            res.add(bufBeg, buf.readPosition() - bufBeg, ts, MapTsItemVec.Ty.CLOSE);
+        }
         state = State.EXPECT_HEADER_A;
         needMin = HEADER_A_LEN;
+        inside = 0;
     }
 
-    void reallocItem() {
-        if (itemP.c >= maxItemElements) {
-            if (maxItemElements >= 128 * 1024) {
-                throw new RuntimeException("too many elements");
-            }
-            int n1 = maxItemElements;
-            maxItemElements *= 4;
-            long[] ts2 = itemP.ts;
-            int[] pos2 = itemP.pos;
-            int[] ty2 = itemP.ty;
-            int[] len2 = itemP.len;
-            itemP.ts = new long[maxItemElements];
-            itemP.pos = new int[maxItemElements];
-            itemP.ty = new int[maxItemElements];
-            itemP.len = new int[maxItemElements];
-            System.arraycopy(ts2, 0, itemP.ts, 0, n1);
-            System.arraycopy(pos2, 0, itemP.pos, 0, n1);
-            System.arraycopy(ty2, 0, itemP.ty, 0, n1);
-            System.arraycopy(len2, 0, itemP.len, 0, n1);
+    public synchronized void release() {
+        if (closed) {
+            LOGGER.error("EventBlobToV1MapTs already closed");
         }
-    }
-
-    public void release() {
+        else {
+            closeCount.getAndAdd(1);
+        }
         LOGGER.debug("{}  {}  EventBlobToV1MapTs release", reqctx, name);
-        if (left != null) {
-            DataBufferUtils.release(left);
-            left = null;
+        if (leftbufcont != null) {
+            BufCont k = leftbufcont;
+            leftbufcont = null;
+            k.close();
         }
-    }
-
-    public Item lastResult() {
-        LOGGER.debug("{}  lastResult  name {}", reqctx, name);
-        DataBuffer buf = bufFac.allocateBuffer(bufferSize);
-        item = apply(buf);
-        item.isLast = true;
-        return item;
     }
 
 }

@@ -255,7 +255,6 @@ public class TestIndex {
 
     @Test
     public void emptyIndexData() {
-        new Index();
         byte[] a = new byte[0];
         assertEquals(-1, Index.findGEByLong(0, a).k);
     }

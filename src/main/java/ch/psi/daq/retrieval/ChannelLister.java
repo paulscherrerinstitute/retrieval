@@ -19,7 +19,7 @@ import java.sql.*;
 import java.util.List;
 
 public class ChannelLister {
-    static Logger LOGGER = (Logger) LoggerFactory.getLogger(ChannelLister.class);
+    static final Logger LOGGER = (Logger) LoggerFactory.getLogger(ChannelLister.class.getSimpleName());
     ConfigurationRetrieval conf;
     DataBufferFactory bufFac;
     ResultSet res;

@@ -13,7 +13,7 @@
         </rollingPolicy>
         <encoder>
             <charset>UTF-8</charset>
-            <pattern>%d{yy-MM-dd HH:mm:ss.SSS, UTC} Z [%thread] %-5level %logger{35} - %msg%n</pattern>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS, UTC} Z [%thread] %-5level %logger{35} - %msg%n</pattern>
         </encoder>
     </appender>
     <appender name="rolling-debug" class="ch.qos.logback.core.rolling.RollingFileAppender">
@@ -27,7 +27,7 @@
         </rollingPolicy>
         <encoder>
             <charset>UTF-8</charset>
-            <pattern>%d{yy-MM-dd HH:mm:ss.SSS, UTC} Z [%thread] %-5level %logger{35} - %msg%n</pattern>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS, UTC} Z [%thread] %-5level %logger{35} - %msg%n</pattern>
         </encoder>
     </appender>
     <root level="INFO">

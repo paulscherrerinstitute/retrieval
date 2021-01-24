@@ -2,19 +2,21 @@ package ch.psi.daq.retrieval.eventmap.value;
 
 import ch.psi.bitshuffle.BitShuffleLZ4JNIDecompressor;
 import ch.psi.daq.retrieval.DTypeBitmapUtils;
+import ch.psi.daq.retrieval.QueryParams;
 import ch.psi.daq.retrieval.ReqCtx;
-import ch.qos.logback.classic.Level;
+import ch.psi.daq.retrieval.bytes.BufCont;
+import ch.psi.daq.retrieval.bytes.Output;
+import ch.psi.daq.retrieval.merger.Releasable;
+import ch.qos.logback.classic.Logger;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonPropertyOrder;
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import net.jpountz.lz4.LZ4Factory;
-import ch.qos.logback.classic.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferFactory;
-import org.springframework.core.io.buffer.DataBufferUtils;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -23,15 +25,24 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 
-public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult> {
-    static final Logger LOGGER = (Logger) LoggerFactory.getLogger("EventBlobToV1Map");
+import static ch.psi.daq.retrieval.controller.QueryData.doDiscard;
+
+public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, Releasable {
+    static final Logger LOGGER = (Logger) LoggerFactory.getLogger(EventBlobToV1Map.class.getSimpleName());
     static final int HEADER_A_LEN = 2 * Integer.BYTES + 4 * Long.BYTES + 2 * Byte.BYTES;
+    static final AtomicLong leftCopiedTimes = new AtomicLong();
+    static final AtomicLong leftCopiedBytes = new AtomicLong();
+    static final AtomicLong applyBufContEmpty = new AtomicLong();
+    static final AtomicLong applyDespiteTerm = new AtomicLong();
+    static final AtomicLong applyEmptyBuffer = new AtomicLong();
+    static final AtomicLong leftWithoutBuf = new AtomicLong();
     DataBufferFactory bufFac;
-    DataBuffer cbuf;
-    DataBuffer kbuf;
-    DataBuffer left;
+    BufCont kbufcont = BufCont.makeEmpty(BufCont.Mark.V1Map_init);
+    BufCont leftbufcont;
     boolean headerOut;
     boolean blobHeaderOut;
     int bufferSize;
@@ -56,10 +67,12 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
     long endNanos;
     boolean unpackOnServer;
     boolean blobUnpack;
-    long limitBytes;
+    QueryParams qp;
+    long writtenEvents;
     long writtenBytes;
     long seenHeaderA;
     ReqCtx reqctx;
+    AtomicInteger released = new AtomicInteger();
 
     enum State {
         EXPECT_HEADER_A,
@@ -86,81 +99,78 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
         public List<Integer> shape;
     }
 
-    public EventBlobToV1Map(ReqCtx reqctx, String channelName, long endNanos, DataBufferFactory bufFac, int bufferSize, boolean unpackOnServer, long limitBytes) {
+    public static class Stats {
+        public long leftCopiedTimes;
+        public long leftCopiedBytes;
+        public long applyBufContEmpty;
+        public long applyDespiteTerm;
+        public long applyEmptyBuffer;
+        public long leftWithoutBuf;
+        public long resultTakenEmpty;
+        public Stats() {
+            leftCopiedTimes = EventBlobToV1Map.leftCopiedTimes.get();
+            leftCopiedBytes = EventBlobToV1Map.leftCopiedBytes.get();
+            applyBufContEmpty = EventBlobToV1Map.applyBufContEmpty.get();
+            applyDespiteTerm = EventBlobToV1Map.applyDespiteTerm.get();
+            applyEmptyBuffer = EventBlobToV1Map.applyEmptyBuffer.get();
+            leftWithoutBuf = EventBlobToV1Map.leftWithoutBuf.get();
+            resultTakenEmpty = EventBlobMapResult.takenEmpty.get();
+        }
+    }
+
+    public EventBlobToV1Map(ReqCtx reqctx, String channelName, long endNanos, DataBufferFactory bufFac, int bufferSize, QueryParams qp) {
         this.reqctx = reqctx;
         this.channelName = channelName;
         this.bufFac = bufFac;
         this.bufferSize = bufferSize;
-        this.bufferSize2 = 2 * bufferSize;
+        this.bufferSize2 = bufferSize * 2;
         this.endNanos = endNanos;
-        this.unpackOnServer = unpackOnServer;
+        this.qp = qp;
+        this.unpackOnServer = qp.decompressOnServer;
+        this.unpackOnServer = false;
         this.state = State.EXPECT_HEADER_A;
         this.needMin = HEADER_A_LEN;
-        this.limitBytes = limitBytes;
     }
 
-    public static Flux<EventBlobMapResult> trans2(ReqCtx reqctx, Flux<DataBuffer> fl, String channelName, long endNanos, DataBufferFactory bufFac, int bufferSize, boolean unpackOnServer, long limitBytes) {
-        final EventBlobToV1Map mapper = new EventBlobToV1Map(reqctx, channelName, endNanos, bufFac, bufferSize, unpackOnServer, limitBytes);
+    public static Flux<EventBlobMapResult> trans(ReqCtx reqctx, Flux<BufCont> fl, String channelName, long endNanos, DataBufferFactory bufFac, int bufferSize, QueryParams qp) {
+        final EventBlobToV1Map mapper = new EventBlobToV1Map(reqctx, channelName, endNanos, bufFac, bufferSize, qp);
         return fl.map(mapper)
         .concatWith(Mono.defer(() -> Mono.just(mapper.lastResult())))
-        .doOnNext(item -> {
-            if (item.term) {
-                LOGGER.warn("{}  EventBlobToV1Map reached TERM", reqctx);
-            }
-        })
-        .takeWhile(item -> !item.term)
-        .doOnDiscard(EventBlobMapResult.class, EventBlobMapResult::release)
-        .doOnTerminate(mapper::release);
+        .takeWhile(EventBlobMapResult::notTerm)
+        .transform(doDiscard("EventBlobToV1MapTrans"))
+        .doFinally(k -> mapper.release());
     }
 
     @Override
-    public EventBlobMapResult apply(DataBuffer buf) {
-        LOGGER.trace("{}  EventBlobToV1Map  apply  state: {}  buf: {}", reqctx, state, buf);
+    public synchronized EventBlobMapResult apply(BufCont bufcont) {
+        if (bufcont.isEmpty()) {
+            applyBufContEmpty.getAndAdd(1);
+            bufcont.close();
+            return EventBlobMapResult.empty();
+        }
         if (state == State.TERM) {
-            LOGGER.debug("{}  apply buffer despite TERM", reqctx);
-            DataBufferUtils.release(buf);
-            EventBlobMapResult res = new EventBlobMapResult();
-            res.term = true;
-            return res;
+            applyDespiteTerm.getAndAdd(1);
+            bufcont.close();
+            return EventBlobMapResult.term();
         }
-        cbuf = bufFac.allocateBuffer(bufferSize2);
-        if (left != null) {
-            if (needMin <= 0) {
-                throw new RuntimeException("logic");
-            }
-            if (left.readableByteCount() <= 0) {
-                throw new RuntimeException("logic");
-            }
-            if (left.readableByteCount() >= needMin) {
-                throw new RuntimeException("logic");
-            }
-            int n = Math.min(buf.readableByteCount(), needMin - left.readableByteCount());
-            int l1 = buf.readableByteCount();
-            int l2 = left.readableByteCount();
-            left.write(buf.slice(buf.readPosition(), n));
-            buf.readPosition(buf.readPosition() + n);
-            if (buf.readableByteCount() + n != l1) {
-                throw new RuntimeException("logic");
-            }
-            if (left.readableByteCount() != l2 + n) {
-                throw new RuntimeException("logic");
-            }
-            if (left.readableByteCount() >= needMin) {
-                LOGGER.debug("{}  parse left  {}", reqctx, state);
-                parse(left);
-                if (left.readableByteCount() != 0) {
-                    throw new RuntimeException("logic");
-                }
-                DataBufferUtils.release(left);
-                left = null;
-            }
+        final DataBuffer buf = bufcont.bufferRef();
+        if (buf.readableByteCount() == 0) {
+            applyEmptyBuffer.getAndAdd(1);
         }
-
+        Output out = new Output(bufFac, bufferSize2, BufCont.Mark.V1Map);
+        if (leftbufcont != null && !leftbufcont.hasBuf()) {
+            leftWithoutBuf.getAndAdd(1);
+            leftbufcont.close();
+            leftbufcont = null;
+        }
+        if (leftbufcont != null && leftbufcont.hasBuf()) {
+            applyLeft(buf, out);
+        }
+        int bufBeg = buf.readPosition();
         while (state != State.TERM && buf.readableByteCount() > 0 && buf.readableByteCount() >= needMin) {
-            LOGGER.debug("{}  parse main  {}  {}", reqctx, state, buf.readPosition());
-            parse(buf);
+            parse(buf, out);
         }
-
+        int bufEnd = buf.readPosition();
         if (state != State.TERM && buf.readableByteCount() > 0) {
             if (needMin <= 0) {
                 throw new RuntimeException("logic");
@@ -168,22 +178,58 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
             if (buf.readableByteCount() >= needMin) {
                 throw new RuntimeException("logic");
             }
-            LOGGER.debug("{}  keep left", reqctx);
-            left = buf;
+            leftbufcont = BufCont.allocate(buf.factory(), 1024, BufCont.Mark.V1Map_left_alloc);
+            DataBuffer left = leftbufcont.bufferRef();
+            left.write(buf);
         }
-        else {
-            DataBufferUtils.release(buf);
-        }
-        DataBuffer rbuf = cbuf;
-        cbuf = null;
-        EventBlobMapResult res = new EventBlobMapResult();
-        res.buf = rbuf;
-        writtenBytes += res.buf.readableByteCount();
-        return res;
+        buf.readPosition(bufBeg);
+        buf.writePosition(bufEnd);
+        bufcont.close();
+        return EventBlobMapResult.fromBuffers(out.take());
     }
 
-    void parse(DataBuffer buf) {
-        LOGGER.debug("{}  parse  state: {}  buf: {}", reqctx, state, buf);
+    void applyLeft(DataBuffer buf, Output out) {
+        DataBuffer left = leftbufcont.bufferRef();
+        if (needMin <= 0) {
+            throw new RuntimeException("logic");
+        }
+        if (left.readableByteCount() <= 0) {
+            throw new RuntimeException("logic");
+        }
+        if (left.readableByteCount() >= needMin) {
+            throw new RuntimeException("logic");
+        }
+        int n = Math.min(buf.readableByteCount(), needMin - left.readableByteCount());
+        int l1 = buf.readableByteCount();
+        int l2 = left.readableByteCount();
+        if (left.writableByteCount() < n) {
+            throw new RuntimeException("logic");
+        }
+        left.write(buf.slice(buf.readPosition(), n));
+        buf.readPosition(buf.readPosition() + n);
+        if (buf.readableByteCount() + n != l1) {
+            throw new RuntimeException("logic");
+        }
+        if (left.readableByteCount() != l2 + n) {
+            throw new RuntimeException("logic");
+        }
+        leftCopiedTimes.getAndAdd(1);
+        leftCopiedBytes.getAndAdd(n);
+        if (left.readableByteCount() >= needMin) {
+            int bufBeg = left.readPosition();
+            parse(left, out);
+            if (left.readableByteCount() != 0) {
+                throw new RuntimeException("logic");
+            }
+            left.writePosition(left.readPosition());
+            left.readPosition(bufBeg);
+            leftbufcont.close();
+            leftbufcont = null;
+        }
+    }
+
+    void parse(DataBuffer buf, Output out) {
+        LOGGER.trace("{}  parse  state: {}  buf: {}", reqctx, state, buf);
         if (buf == null) {
             throw new RuntimeException("logic");
         }
@@ -200,7 +246,7 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
             parseHeaderD(buf);
         }
         else if (state == State.EXPECT_BLOBS) {
-            parseBlob(buf);
+            parseBlob(buf, out);
         }
         else if (state == State.EXPECT_SECOND_LENGTH) {
             parseSecondLength(buf);
@@ -238,14 +284,6 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
         byte severity = bb.get();
         seenHeaderA += 1;
         LOGGER.trace("{}  seen  length {}  timestamp {}  pulse {}  seenHeaderA {}", reqctx, length, ts, pulse, seenHeaderA);
-        if (ts < 100100100100100100L || ts > 1800100100100100100L) {
-            LOGGER.warn("{}  unexpected ts {}", reqctx, ts);
-            //throw new RuntimeException("error");
-        }
-        if (pulse < -1 || pulse > 40100100100L) {
-            LOGGER.warn("{}  unexpected pulse {}", reqctx, pulse);
-            //throw new RuntimeException("error");
-        }
         if (ts >= endNanos) {
             LOGGER.debug("{}  stop  ts {}  >=  end {}", reqctx, ts, endNanos);
             state = State.TERM;
@@ -332,7 +370,6 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
             }
             blobsByteOrder = ByteOrder.LITTLE_ENDIAN;
         }
-        //LOGGER.info(String.format("dtypeBitmask: %8x", dtypeBitmask));
         if ((dtypeBitmask & 0x1000) != 0) {
             if (blobsShape != -1 && blobsShape != 1) {
                 throw new RuntimeException("logic");
@@ -355,7 +392,6 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
             throw new RuntimeException("shape without array");
         }
         state = State.EXPECT_HEADER_C;
-        //LOGGER.info("{}  end of header C  type {}  array {}", reqctx, blobsType, blobsArray);
     }
 
     void parseHeaderC(DataBuffer buf) {
@@ -380,7 +416,7 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
         if (blobsShape == 1) {
             shapeDims = 0xff & bb.get();
             needMin = shapeDims * Integer.BYTES;
-            LOGGER.debug("{}  has shape, dims: {}", reqctx, shapeDims);
+            //LOGGER.debug("{}  has shape, dims: {}", reqctx, shapeDims);
         }
         if (shapeDims > 3) {
             LOGGER.warn("{}  currentEvent.shapeDims  {}  {} > 3", reqctx, channelName, shapeDims);
@@ -403,21 +439,14 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
             int n = bb.getInt();
             shapeLens[i] = n;
         }
-        cbuf = ensureWritable(cbuf, 256 + valueBytes);
         if (blobUnpack) {
-            if (true) {
-                LOGGER.error("{}  blobUnpack not supported currently", reqctx);
-                throw new RuntimeException("todo");
-            }
-
-            if (kbuf == null) {
-                kbuf = bufFac.allocateBuffer(bufferSize2);
-            }
+            LOGGER.error("{}  blobUnpack not supported currently", reqctx);
+            throw new RuntimeException("todo");
         }
         state = State.EXPECT_BLOBS;
         needMin = 0;
         // ugly fixes for bug in writer
-        if (blobsCompression > 0) {
+        if (blobsCompression > 0 || blobsArray == 1 && blobsShape != 1) {
             needMin = 8;
         }
     }
@@ -434,23 +463,7 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
         return 1;
     }
 
-    DataBuffer ensureWritable(DataBuffer buf, int n) {
-        int now = buf.writableByteCount();
-        if (now >= n) {
-            return buf;
-        }
-        int wp = buf.writePosition();
-        while (bufferSize2 < wp + n) {
-            bufferSize2 *= 2;
-            if (bufferSize2 > 32 * 1024 * 1024) {
-                throw new RuntimeException("maximum buffer size exceeded");
-            }
-        }
-        buf.ensureCapacity(bufferSize2);
-        return buf;
-    }
-
-    void parseBlob(DataBuffer buf) {
+    void parseBlob(DataBuffer buf, Output out) {
         final int n = Math.min(buf.readableByteCount(), missingBytes);
         // TODO do we enforce same compression for all blobs?
         if (blobUnpack) {
@@ -458,29 +471,32 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
                 LOGGER.error("{}  blobUnpack not supported currently", reqctx);
                 throw new RuntimeException("todo");
             }
-            kbuf = ensureWritable(kbuf, n);
-            kbuf.write(buf.slice(buf.readPosition(), n));
+            if (kbufcont.isEmpty()) {
+                kbufcont = BufCont.allocate(bufFac, n, BufCont.Mark.V1Map_kbuf_alloc);
+            }
+            // TODO
+            //kbufcont = kbufcont.ensureWritable(n);
+            kbufcont.bufferRef().write(buf.slice(buf.readPosition(), n));
             buf.readPosition(buf.readPosition() + n);
         }
         else {
-            ensureWritable(cbuf, 21 + n);
             if (!blobHeaderOut) {
-                // ugly fixes for bug in writer
                 if (blobsArray == 1 && blobsShape != 1) {
                     if (buf.readableByteCount() < 8) {
                         throw new RuntimeException("logic");
                     }
                     ByteBuffer src = buf.asByteBuffer(buf.readPosition(), 8);
                     int nf = (int) src.getLong();
-                    LOGGER.trace("{}  current shape: {}  {}", reqctx, shapeDims, shapeLens);
+                    //LOGGER.info("{}  nf {}  shapeDims {}  shapeLens {}", reqctx, nf, shapeDims, shapeLens);
                     shapeDims = 1;
                     shapeLens[0] = nf / sizeOf(blobsType);
                 }
                 if (!headerOut) {
-                    writeHeader(cbuf, channelName);
+                    writeHeader(out, channelName);
                     headerOut = true;
                 }
-                LOGGER.trace("{}  write len1 {}  at {}", reqctx, 17 + valueBytes, cbuf.writePosition());
+                out.ensureWritable(21);
+                DataBuffer cbuf = out.bufferRef();
                 ByteBuffer bbuf = cbuf.asByteBuffer(cbuf.writePosition(), 21);
                 cbuf.writePosition(cbuf.writePosition() + 21);
                 bbuf.putInt(17 + valueBytes);
@@ -489,8 +505,7 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
                 bbuf.putLong(pulse);
                 blobHeaderOut = true;
             }
-            cbuf.write(buf.slice(buf.readPosition(), n));
-            buf.readPosition(buf.readPosition() + n);
+            out.transfer(buf, n);
         }
         missingBytes -= n;
         if (missingBytes > 0) {
@@ -502,6 +517,7 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
                     LOGGER.error("{}  blobUnpack not supported currently", reqctx);
                     throw new RuntimeException("todo");
                 }
+                final DataBuffer kbuf = kbufcont.bufferRef();
                 if (blobsCompression == 1) {
                     if (false) {
                         ByteBuffer src = kbuf.asByteBuffer(12, kbuf.writePosition());
@@ -535,21 +551,24 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
                             shapeDims = 1;
                             shapeLens[0] = nf/tsize;
                         }
-                        writeHeader(cbuf, channelName);
+                        writeHeader(out, channelName);
                         headerOut = true;
                     }
-                    int m = nf;
-                    cbuf = ensureWritable(cbuf, m + 128);
-                    ByteBuffer bbuf = cbuf.asByteBuffer(cbuf.writePosition(), 21);
-                    cbuf.writePosition(cbuf.writePosition() + 21);
-                    bbuf.putInt(17 + m);
-                    bbuf.put((byte) 1);
-                    bbuf.putLong(ts);
-                    bbuf.putLong(pulse);
-                    cbuf.write(dst);
-                    bbuf = cbuf.asByteBuffer(cbuf.writePosition(), 4);
-                    cbuf.writePosition(cbuf.writePosition() + 4);
-                    bbuf.putInt(17 + m);
+                    {
+                        int m = nf;
+                        out.ensureWritable(21 + dst.remaining() + 4);
+                        DataBuffer cbuf = out.bufferRef();
+                        ByteBuffer bbuf = cbuf.asByteBuffer(cbuf.writePosition(), 21);
+                        cbuf.writePosition(cbuf.writePosition() + 21);
+                        bbuf.putInt(17 + m);
+                        bbuf.put((byte) 1);
+                        bbuf.putLong(ts);
+                        bbuf.putLong(pulse);
+                        cbuf.write(dst);
+                        bbuf = cbuf.asByteBuffer(cbuf.writePosition(), 4);
+                        cbuf.writePosition(cbuf.writePosition() + 4);
+                        bbuf.putInt(17 + m);
+                    }
                 }
                 else if (blobsCompression == 2) {
                     throw new RuntimeException("plain lz4 not handled yet");
@@ -561,8 +580,9 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
                 kbuf.writePosition(0);
             }
             else {
+                out.ensureWritable(4);
+                DataBuffer cbuf = out.bufferRef();
                 LOGGER.trace("{}  parseBlob  write len2 {}  at cbuf {}  ts {} {}", reqctx, 17 + valueBytes, cbuf.writePosition(), ts / 1000000000, ts % 1000000000);
-                cbuf = ensureWritable(cbuf, 4);
                 ByteBuffer bbuf = cbuf.asByteBuffer(cbuf.writePosition(), 4);
                 cbuf.writePosition(cbuf.writePosition() + 4);
                 bbuf.putInt(17 + valueBytes);
@@ -584,40 +604,46 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
         }
         state = State.EXPECT_HEADER_A;
         needMin = HEADER_A_LEN;
-        if (limitBytes > 0 && writtenBytes >= limitBytes) {
-            LOGGER.warn("{}  limit reached.  {}  written {}  limit {}", reqctx, channelName, writtenBytes, limitBytes);
+        writtenEvents += 1;
+        if (qp.limitEventsPerChannel > 0 && writtenEvents >= qp.limitEventsPerChannel) {
+            LOGGER.warn("{}  limit reached  writtenBytes {}  writtenEvents {}  limit {}  channel {}", reqctx, writtenBytes, writtenEvents, qp.limitEventsPerChannel, channelName);
             state = State.TERM;
         }
+        //LOGGER.info("parseSecondLength  ts {}  valueBytes {}", ts, valueBytes);
     }
 
-    public void release() {
+    public synchronized void release() {
         LOGGER.debug("{}  EventBlobToV1Map release  seenHeaderA {}  writtenBytes {}", reqctx, seenHeaderA, writtenBytes);
-        if (cbuf != null) {
-            DataBufferUtils.release(cbuf);
-            cbuf = null;
+        if (leftbufcont != null) {
+            BufCont k = leftbufcont;
+            leftbufcont = null;
+            k.close();
         }
-        if (left != null) {
-            DataBufferUtils.release(left);
-            left = null;
-        }
-        if (kbuf != null) {
-            DataBufferUtils.release(kbuf);
-            kbuf = null;
+        if (kbufcont != null) {
+            BufCont k = kbufcont;
+            kbufcont = null;
+            k.close();
         }
     }
 
-    public EventBlobMapResult lastResult() {
-        LOGGER.debug("{}  EventBlobToV1Map lastResult", reqctx);
-        DataBuffer buf = bufFac.allocateBuffer(bufferSize2);
+    public void releaseFinite() {
+        release();
+    }
+
+    public synchronized EventBlobMapResult lastResult() {
+        LOGGER.debug("until now total written {}", writtenBytes);
         if (!headerOut) {
-            writeHeader(buf, channelName);
+            LOGGER.debug("{}  EventBlobToV1Map lastResult  not headerOut", reqctx);
+            Output out = new Output(bufFac, bufferSize2, BufCont.Mark.V1MapLast);
+            writeHeader(out, channelName);
+            return EventBlobMapResult.fromBuffers(out.take());
         }
-        EventBlobMapResult res = new EventBlobMapResult();
-        res.buf = buf;
-        return res;
+        else {
+            return EventBlobMapResult.empty();
+        }
     }
 
-    void writeHeader(DataBuffer buf, String channelName) {
+    void writeHeader(Output out, String channelName) {
         BlobJsonHeader header = new BlobJsonHeader();
         header.name = channelName;
         if (blobsType != -1) {
@@ -656,16 +682,20 @@ public class EventBlobToV1Map implements Function<DataBuffer, EventBlobMapResult
         ByteBuffer headerEncoded = StandardCharsets.UTF_8.encode(headerString);
         int nh = headerEncoded.remaining();
         int n = Integer.BYTES + Byte.BYTES + nh + Integer.BYTES;
-        ByteBuffer bb1 = buf.asByteBuffer(buf.writePosition(), n);
-        buf.writePosition(buf.writePosition() + n);
-        bb1.putInt(0);
-        bb1.put((byte)0);
-        bb1.put(headerEncoded);
-        if (bb1.position() != 5 + nh) {
-            throw new RuntimeException("logic");
+        {
+            out.ensureWritable(n);
+            DataBuffer cbuf = out.bufferRef();
+            ByteBuffer bb = cbuf.asByteBuffer(cbuf.writePosition(), n);
+            cbuf.writePosition(cbuf.writePosition() + n);
+            bb.putInt(0);
+            bb.put((byte) 0);
+            bb.put(headerEncoded);
+            if (bb.position() != 5 + nh) {
+                throw new RuntimeException("logic");
+            }
+            bb.putInt(0, 1 + nh);
+            bb.putInt(1 + nh);
         }
-        bb1.putInt(0, 1 + nh);
-        bb1.putInt(1 + nh);
     }
 
 }

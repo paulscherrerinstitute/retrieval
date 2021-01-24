@@ -47,7 +47,7 @@ public class AggMapper {
 
     public List<DataBuffer> map(MapJsonResult res) {
         try {
-            for (MapJsonItem item : res.items) {
+            for (MapJsonItem item : res.getItems()) {
                 item.mapOutput(this, jgen, jst);
             }
         }

@@ -1,4 +1,4 @@
-package ch.psi.daq.retrieval;
+package ch.psi.daq.retrieval.eventmap;
 
 public enum EventDataType {
     BOOL,

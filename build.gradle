@@ -1,6 +1,7 @@
 buildscript {
     repositories {
-        jcenter()
+        mavenCentral()
+        //jcenter()
     }
     dependencies {
         classpath 'com.jfrog.bintray.gradle:gradle-bintray-plugin:1.8.2'
@@ -8,22 +9,24 @@ buildscript {
 }
 
 plugins {
-    id 'org.springframework.boot' version '2.3.5.RELEASE'
+    id 'org.springframework.boot' version '2.4.1'
     id 'maven-publish'
     id 'java-library'
-    id 'jacoco'
+    //id 'jacoco'
 }
 
-def springBootVersion = '2.3.5.RELEASE'
+def springBootVersion = '2.4.1'
 
 apply plugin: 'java'
 apply plugin: 'io.spring.dependency-management'
 apply plugin: 'org.springframework.boot'
 apply plugin: 'com.jfrog.bintray'
 
+/*
 jacoco {
     toolVersion = "0.8.5"
 }
+*/
 
 java {
     sourceCompatibility = JavaVersion.VERSION_11
@@ -31,7 +34,7 @@ java {
 }
 
 group 'ch.psi.daq'
-version '0.0.8-a.002'
+version '2.0.0'
 
 bintray {
     user = System.getenv('BINTRAY_USER')
@@ -53,40 +56,48 @@ bintray {
 }
 
 repositories {
-    //mavenCentral()
-    jcenter()
+    mavenCentral()
+    //jcenter()
     maven { url "https://dl.bintray.com/paulscherrerinstitute/hltools" }
 }
 
 dependencies {
-    implementation 'ch.qos.logback:logback-classic:1.2.3'
-    implementation 'org.springframework.boot:spring-boot-starter-webflux:'+springBootVersion
-    implementation 'org.springframework.boot:spring-boot-starter-reactor-netty:'+springBootVersion
-    implementation 'org.springframework.boot:spring-boot-configuration-processor:'+springBootVersion
+    implementation group: 'ch.qos.logback', name: 'logback-classic', version: '1.2.3'
+    implementation group: 'org.springframework.boot', name: 'spring-boot-starter-webflux', version: springBootVersion
+    implementation group: 'org.springframework.boot', name: 'spring-boot-starter-reactor-netty', version: springBootVersion
+    implementation group: 'org.springframework.boot', name: 'spring-boot-configuration-processor', version: springBootVersion
     testImplementation group: 'org.springframework.boot', name: 'spring-boot-starter-test', version: springBootVersion
-    implementation 'com.google.guava:guava:30.0-jre'
+    implementation group: 'com.google.guava', name: 'guava', version: '30.1-jre'
     implementation group: 'ch.psi', name: 'bsread', version: '3.5.14'
     implementation group: 'ch.psi', name: 'bitshuffle-lz4', version: '1.1.2'
     implementation group: 'org.junit.jupiter', name: 'junit-jupiter', version: '5.7.0'
     implementation group: 'org.postgresql', name: 'postgresql', version: '42.2.18.jre7'
     testImplementation group: 'junit', name: 'junit', version: '4.13.1'
-    implementation(files("../ch.psi.daq.retrievalutils/build/libs/ch.psi.daq.retrievalutils-0.0.1.jar"))
+    implementation(files('../ch.psi.daq.retrievalutils/build/libs/ch.psi.daq.retrievalutils-0.0.1.jar'))
+    implementation group: 'io.projectreactor', name: 'reactor-tools', version: '3.4.1'
 }
 
 processResources {
     outputs.upToDateWhen { false }
-    expand(appVersion: project.version, buildDateTime: ZonedDateTime.now(ZoneOffset.UTC).toString())
+    List<String> cmd1 = ArrayList.of("git", "describe", "--dirty", "--always", "--abbrev=9")
+    String[] cmd2 = (String[])cmd1.toArray()
+    Process p = Runtime.getRuntime().exec((String[])cmd1.toArray())
+    byte[] buf = Runtime.getRuntime().exec(cmd2).inputStream.readAllBytes()
+    String commitDescribe = StandardCharsets.UTF_8.decode(ByteBuffer.wrap(buf))
+    expand(appVersion: project.version, buildDateTime: ZonedDateTime.now(ZoneOffset.UTC).format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssz")), commitDescribe: commitDescribe)
 }
 
 jar { enabled = true }
-bootJar { classifier = 'all' }
+bootJar { archiveClassifier.set('all') }
 
+/*
 jacocoTestReport {
     reports {
         xml.enabled (project.properties["covxml"] ? true : false)
         html.enabled (project.properties["covxml"] ? false : true)
     }
 }
+*/
 
 publishing {
     publications {
@@ -101,6 +112,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.time.ZoneOffset
 import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 
 task bootJarVer {
     dependsOn bootJar

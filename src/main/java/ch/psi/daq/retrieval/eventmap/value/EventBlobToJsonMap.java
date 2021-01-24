@@ -2,17 +2,16 @@ package ch.psi.daq.retrieval.eventmap.value;
 
 import ch.psi.bitshuffle.BitShuffleLZ4JNIDecompressor;
 import ch.psi.daq.retrieval.DTypeBitmapUtils;
-import ch.psi.daq.retrieval.EventDataType;
+import ch.psi.daq.retrieval.eventmap.EventDataType;
+import ch.psi.daq.retrieval.bytes.BufCont;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonPropertyOrder;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import ch.qos.logback.classic.Logger;
-import org.reactivestreams.Publisher;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferFactory;
-import org.springframework.core.io.buffer.DataBufferUtils;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -23,17 +22,14 @@ import java.util.List;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
-import static ch.psi.daq.retrieval.EventDataType.*;
+import static ch.psi.daq.retrieval.eventmap.EventDataType.*;
 
-public class EventBlobToJsonMap implements Function<DataBuffer, MapJsonResult> {
+public class EventBlobToJsonMap implements Function<BufCont, MapJsonResult> {
     static Logger LOGGER = (Logger) LoggerFactory.getLogger("EventBlobToJsonMap");
-    static {
-        //LOGGER.setLevel(Level.INFO);
-    }
     static final int HEADER_A_LEN = 2 * Integer.BYTES + 4 * Long.BYTES + 2 * Byte.BYTES;
     DataBufferFactory bufFac;
-    DataBuffer kbuf;
-    DataBuffer left;
+    BufCont kbufcont = BufCont.makeEmpty(BufCont.Mark.JsMap_init);
+    BufCont leftbufcont = BufCont.makeEmpty(BufCont.Mark.JsMap_init);
     boolean headerOut;
     boolean blobHeaderOut;
     int bufferSize;
@@ -96,47 +92,35 @@ public class EventBlobToJsonMap implements Function<DataBuffer, MapJsonResult> {
         this.limitBytes = limitBytes;
     }
 
-    public static Flux<MapJsonResult> trans2(Flux<DataBuffer> fl, String channelName, long endNanos, DataBufferFactory bufFac, int bufferSize, long limitBytes) {
+    public static Flux<MapJsonResult> trans2(Flux<BufCont> fl, String channelName, long endNanos, DataBufferFactory bufFac, int bufferSize, long limitBytes) {
         EventBlobToJsonMap mapper = new EventBlobToJsonMap(channelName, endNanos, bufFac, bufferSize, limitBytes);
         return fl.map(mapper)
         .concatWith(Mono.defer(() -> Mono.just(mapper.lastResult())))
         .doOnNext(item -> {
-            if (item.term) {
+            if (item.isTerm()) {
                 LOGGER.warn("reached TERM");
             }
         })
-        .takeWhile(item -> !item.term)
+        .takeWhile(item -> !item.isTerm())
         .doOnDiscard(MapJsonResult.class, MapJsonResult::release)
-        .doOnTerminate(mapper::release);
-    }
-
-    public static Function<Flux<DataBuffer>, Publisher<MapJsonResult>> trans(String channelName, long endNanos, DataBufferFactory bufFac, int bufferSize, long limitBytes) {
-        EventBlobToJsonMap mapper = new EventBlobToJsonMap(channelName, endNanos, bufFac, bufferSize, limitBytes);
-        return fl -> {
-            return fl.map(mapper)
-            .concatWith(Mono.defer(() -> Mono.just(mapper.lastResult())))
-            .doOnNext(item -> {
-                if (item.term) {
-                    LOGGER.warn("reached TERM");
-                }
-            })
-            .takeWhile(item -> !item.term)
-            .doOnDiscard(MapJsonResult.class, MapJsonResult::release)
-            .doOnTerminate(mapper::release);
-        };
+        .doFinally(k -> mapper.release());
     }
 
     @Override
-    public MapJsonResult apply(DataBuffer buf) {
-        LOGGER.trace("apply  state: {}  buf: {}", state, buf);
-        MapJsonResult res = new MapJsonResult();
-        if (state == State.TERM) {
-            //LOGGER.info("apply buffer despite TERM");
-            DataBufferUtils.release(buf);
-            res.term = true;
-            return res;
+    public MapJsonResult apply(BufCont bufcont) {
+        if (bufcont.isEmpty()) {
+            throw new RuntimeException("empty BufCont");
         }
-        if (left != null) {
+        final DataBuffer buf = bufcont.bufferRef();
+        LOGGER.trace("apply  state: {}  buf: {}", state, buf);
+        if (state == State.TERM) {
+            LOGGER.debug("{}  apply buffer despite TERM", "[ADDREQID]");
+            bufcont.close();
+            return MapJsonResult.term();
+        }
+        MapJsonResult res = MapJsonResult.empty();
+        if (leftbufcont.hasBuf()) {
+            DataBuffer left = leftbufcont.bufferRef();
             if (needMin <= 0) {
                 throw new RuntimeException("logic");
             }
@@ -159,18 +143,19 @@ public class EventBlobToJsonMap implements Function<DataBuffer, MapJsonResult> {
             }
             if (left.readableByteCount() >= needMin) {
                 LOGGER.debug("parse left  {}", state);
-                parse(res, left);
+                parse(left, res);
                 if (left.readableByteCount() != 0) {
                     throw new RuntimeException("logic");
                 }
-                DataBufferUtils.release(left);
+                leftbufcont.close();
                 left = null;
+                leftbufcont = BufCont.makeEmpty(BufCont.Mark.JsMap_init_2nd);
             }
         }
 
         while (state != State.TERM && buf.readableByteCount() > 0 && buf.readableByteCount() >= needMin) {
             LOGGER.debug("parse main  {}  {}", state, buf.readPosition());
-            parse(res, buf);
+            parse(buf, res);
         }
 
         if (state != State.TERM && buf.readableByteCount() > 0) {
@@ -181,16 +166,16 @@ public class EventBlobToJsonMap implements Function<DataBuffer, MapJsonResult> {
                 throw new RuntimeException("logic");
             }
             LOGGER.debug("keep left");
-            left = buf;
+            leftbufcont = bufcont;
+            bufcont = null;
         }
-        else {
-            DataBufferUtils.release(buf);
+        if (bufcont != null) {
+            bufcont.close();
         }
-        //LOGGER.error("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  {}", res.items.size());
         return res;
     }
 
-    void parse(MapJsonResult res, DataBuffer buf) {
+    void parse(DataBuffer buf, MapJsonResult res) {
         LOGGER.debug("parse  state: {}  buf: {}", state, buf);
         if (buf == null) {
             throw new RuntimeException("logic");
@@ -205,10 +190,10 @@ public class EventBlobToJsonMap implements Function<DataBuffer, MapJsonResult> {
             parseHeaderC(buf);
         }
         else if (state == State.EXPECT_HEADER_D) {
-            parseHeaderD(buf);
+            parseHeaderD(buf, res);
         }
         else if (state == State.EXPECT_BLOBS) {
-            parseBlob(res, buf);
+            parseBlob(buf, res);
         }
         else if (state == State.EXPECT_SECOND_LENGTH) {
             parseSecondLength(buf);
@@ -393,7 +378,7 @@ public class EventBlobToJsonMap implements Function<DataBuffer, MapJsonResult> {
         state = State.EXPECT_HEADER_D;
     }
 
-    void parseHeaderD(DataBuffer buf) {
+    void parseHeaderD(DataBuffer buf, MapJsonResult res) {
         ByteBuffer bb = buf.asByteBuffer(buf.readPosition(), needMin);
         buf.readPosition(buf.readPosition() + needMin);
         headerLength += needMin;
@@ -415,34 +400,10 @@ public class EventBlobToJsonMap implements Function<DataBuffer, MapJsonResult> {
         }
     }
 
-    DataBuffer ensureWritable(DataBuffer buf, int n) {
-        if (buf == null) {
-            buf = bufFac.allocateBuffer(bufferSize2);
-        }
-        int now = buf.writableByteCount();
-        if (now >= n) {
-            return buf;
-        }
-        int wp = buf.writePosition();
-        while (bufferSize2 < wp + n) {
-            bufferSize2 *= 2;
-            if (bufferSize2 > 32 * 1024 * 1024) {
-                throw new RuntimeException("maximum buffer size exceeded");
-            }
-        }
-        DataBuffer old = buf;
-        int rp0 = old.readPosition();
-        int wp0 = old.writePosition();
-        buf = bufFac.allocateBuffer(bufferSize2);
-        buf.write(old.slice(0, wp0));
-        buf.writePosition(wp0);
-        buf.readPosition(rp0);
-        return buf;
-    }
-
     void writeEvent(MapJsonResult res) {
         EventDataType edt = EventDataType.vals[blobsType];
         if (blobsCompression == 0) {
+            DataBuffer kbuf = kbufcont.bufferRef();
             //LOGGER.info("WRITE UNCOMPRESSED");
             if (kbuf.readableByteCount() != edt.sizeOf()) {
                 throw new RuntimeException("error");
@@ -456,7 +417,7 @@ public class EventBlobToJsonMap implements Function<DataBuffer, MapJsonResult> {
                 MapJsonEvent ev = new MapJsonEvent();
                 ev.ts = ts;
                 ev.pulse = pulse;
-                res.items.add(ev);
+                res.addItem(ev);
                 if (edt == UINT8) {
                     ev.data = JsonNodeFactory.instance.numberNode(0xff & src.get());
                 }
@@ -499,6 +460,7 @@ public class EventBlobToJsonMap implements Function<DataBuffer, MapJsonResult> {
             }
         }
         else if (blobsCompression == 1) {
+            DataBuffer kbuf = kbufcont.bufferRef();
             ByteBuffer src = kbuf.asByteBuffer(0, kbuf.writePosition());
             int nbytes = (int) src.getLong();
             if (nbytes > 1024 * 128) {
@@ -527,7 +489,7 @@ public class EventBlobToJsonMap implements Function<DataBuffer, MapJsonResult> {
             MapJsonEvent ev = new MapJsonEvent();
             ev.ts = ts;
             ev.pulse = pulse;
-            res.items.add(ev);
+            res.addItem(ev);
             if (edt.isInt()) {
                 if (edt.isSignedInt()) {
                     if (blobsArray == 1) {
@@ -610,14 +572,19 @@ public class EventBlobToJsonMap implements Function<DataBuffer, MapJsonResult> {
         else {
             throw new RuntimeException("unknown compression");
         }
-        kbuf.readPosition(0);
-        kbuf.writePosition(0);
+        {
+            DataBuffer kbuf = kbufcont.bufferRef();
+            kbuf.readPosition(0);
+            kbuf.writePosition(0);
+        }
     }
 
-    void parseBlob(MapJsonResult res, DataBuffer buf) {
+    void parseBlob(DataBuffer buf, MapJsonResult res) {
         final int n = Math.min(buf.readableByteCount(), missingBytes);
         // TODO do we enforce same compression for all blobs?
-        kbuf = ensureWritable(kbuf, n);
+        // TODO
+        //kbufcont = kbufcont.ensureWritable(n);
+        DataBuffer kbuf = kbufcont.bufferRef();
         kbuf.write(buf.slice(buf.readPosition(), n));
         buf.readPosition(buf.readPosition() + n);
         missingBytes -= n;
@@ -655,13 +622,13 @@ public class EventBlobToJsonMap implements Function<DataBuffer, MapJsonResult> {
 
     public void release() {
         LOGGER.info("release  seenHeaderA {}", seenHeaderA);
-        if (left != null) {
-            DataBufferUtils.release(left);
-            left = null;
+        if (leftbufcont != null) {
+            leftbufcont.close();
+            leftbufcont = null;
         }
-        if (kbuf != null) {
-            DataBufferUtils.release(kbuf);
-            kbuf = null;
+        if (kbufcont != null) {
+            kbufcont.close();
+            kbufcont = null;
         }
     }
 
@@ -669,7 +636,7 @@ public class EventBlobToJsonMap implements Function<DataBuffer, MapJsonResult> {
         LOGGER.info("lastResult");
         // TODO can I ever have a last result?
         // TODO is the default state a valid empty state?
-        MapJsonResult res = new MapJsonResult();
+        MapJsonResult res = MapJsonResult.empty();
         if (!headerOut) {
             writeHeader(res, channelName);
         }
@@ -679,7 +646,7 @@ public class EventBlobToJsonMap implements Function<DataBuffer, MapJsonResult> {
     void writeHeader(MapJsonResult res, String channelName) {
         MapJsonChannelStart mapev = new MapJsonChannelStart();
         mapev.name = channelName;
-        res.items.add(mapev);
+        res.addItem(mapev);
         BlobJsonHeader header = new BlobJsonHeader();
         header.name = channelName;
         if (blobsType != -1) {

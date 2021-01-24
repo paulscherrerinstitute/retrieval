@@ -2,6 +2,7 @@ package ch.psi.daq.retrieval.finder;
 
 import ch.psi.daq.retrieval.RangeTs;
 import ch.psi.daq.retrieval.ReqCtx;
+import ch.psi.daq.retrieval.config.ChannelConfigEntry;
 import org.springframework.core.io.buffer.DataBufferFactory;
 import reactor.core.publisher.Flux;
 
@@ -13,15 +14,15 @@ public class DatafileScan {
         return Flux.fromIterable(channelNames)
         .map(k -> new Channel(new BaseDir(sts.baseDir, sts.ksPrefix), k))
         .concatMap(channel -> BaseDirFinderFormatV0.channelConfig(reqctx, channel, bufFac))
-        .flatMapIterable(k -> {
+        .concatMapIterable(k -> {
             if (k.isPresent()) {
                 return k.get().entries;
             }
             else {
                 return List.of();
             }
-        })
-        .map(k -> k.toString());
+        }, 1)
+        .map(ChannelConfigEntry::toString);
     }
 
 }

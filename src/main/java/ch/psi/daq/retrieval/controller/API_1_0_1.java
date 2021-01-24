@@ -1,11 +1,14 @@
 package ch.psi.daq.retrieval.controller;
 
-import ch.psi.daq.retrieval.*;
+import ch.psi.daq.retrieval.ChannelLister;
+import ch.psi.daq.retrieval.ReqCtx;
+import ch.psi.daq.retrieval.bytes.BufCont;
 import ch.psi.daq.retrieval.config.ConfigurationRetrieval;
 import ch.psi.daq.retrieval.finder.BaseDirFinderFormatV0;
-import ch.psi.daq.retrieval.pod.api1.channelsearch.ChannelSearchQuery;
 import ch.psi.daq.retrieval.pod.api1.Query;
+import ch.psi.daq.retrieval.pod.api1.channelsearch.ChannelSearchQuery;
 import ch.psi.daq.retrieval.status.RequestStatus;
+import ch.psi.daq.retrieval.throttle.Throttle;
 import ch.qos.logback.classic.Logger;
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -13,12 +16,18 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.web.context.WebServerInitializedEvent;
 import org.springframework.context.ApplicationListener;
-import org.springframework.core.io.buffer.*;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.util.ResourceUtils;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Hooks;
@@ -33,19 +42,22 @@ import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.*;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 
 @RestController
 public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent> {
-    static Logger LOGGER = (Logger) LoggerFactory.getLogger(API_1_0_1.class);
-    @Value("${retrieval.dataBaseDir:UNDEFINED}") public String dataBaseDir;
-    @Value("${retrieval.baseKeyspaceName:UNDEFINED}") public String baseKeyspaceName;
-    @Value("${retrieval.configFile:UNDEFINED}") String configFile;
+    static Logger LOGGER = (Logger) LoggerFactory.getLogger(API_1_0_1.class.getSimpleName());
+    @Value("${retrieval.configFile:#{null}}") String configFile;
     public QueryData queryData;
     public int localPort;
-    ConfigurationRetrieval conf;
-    InetAddress localAddress = null;
+    public ConfigurationRetrieval conf;
+    InetAddress localAddress;
     String localAddressString;
     String localHostname;
     String canonicalHostname;
@@ -61,12 +73,28 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
         }
         localAddressString = String.format("%s", localAddress);
     }
-    DataBufferFactory defaultDataBufferFactory = new DefaultDataBufferFactory();
+    public static final ZonedDateTime tsStartup = ZonedDateTime.now(ZoneOffset.UTC);
+    final AtomicLong totalDataRequests = new AtomicLong();
+
+    @Scheduled(fixedRate = 4000)
+    public void statusgc() {
+        if (queryData != null) {
+            queryData.scheduledStatusClean();
+        }
+        else {
+            LOGGER.warn("statusgc queryData not yet ready");
+        }
+    }
+
+    @Scheduled(fixedRate = 10000)
+    public void buffergc() {
+        BufCont.gc();
+    }
 
     @PostMapping(path = "/api/1/query", consumes = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> query(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
         // The default is octets, to stay compatible with older clients
-        ReqCtx reqctx = ReqCtx.fromRequest(exchange.getRequest());
+        ReqCtx reqctx = ReqCtx.fromRequest(exchange);
         LOGGER.warn("{}  /query via default endpoint", reqctx);
         if (exchange.getRequest().getHeaders().getAccept().contains(MediaType.APPLICATION_OCTET_STREAM)) {
             LOGGER.warn("{}  started in default endpoint despite having octet-stream set", reqctx);
@@ -91,12 +119,13 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
 
     @PostMapping(path = "/api/1/query", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> queryProducesOctets(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        ReqCtx reqctx = ReqCtx.fromRequest(exchange.getRequest());
+        totalDataRequests.getAndAdd(1);
+        ReqCtx reqctx = ReqCtx.fromRequest(exchange);
         if (conf.mergeLocal) {
-            return queryData.queryMergedOctetsLocal(reqctx, exchange, queryMono);
+            return queryData.queryMergedOctetsLocal(reqctx, queryMono);
         }
         else {
-            return queryData.queryMergedOctets(reqctx, exchange, queryMono);
+            return queryData.queryMergedOctets(reqctx, queryMono);
         }
     }
 
@@ -117,7 +146,8 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
 
     @PostMapping(path = "/api/1/query", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> queryProducesJson(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        ReqCtx reqctx = ReqCtx.fromRequest(exchange.getRequest());
+        totalDataRequests.getAndAdd(1);
+        ReqCtx reqctx = ReqCtx.fromRequest(exchange);
         if (!exchange.getRequest().getHeaders().getAccept().contains(MediaType.APPLICATION_JSON)) {
             LOGGER.warn("{}  /query for json without Accept header", reqctx);
         }
@@ -141,19 +171,21 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
 
     @PostMapping(path = "/api/1/queryMerged", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> queryMergedOctets(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        return queryData.queryMergedOctets(ReqCtx.fromRequest(exchange.getRequest()), exchange, queryMono);
+        totalDataRequests.getAndAdd(1);
+        return queryData.queryMergedOctets(ReqCtx.fromRequest(exchange), queryMono);
     }
 
     @PostMapping(path = "/api/1/queryLocal", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> queryLocal(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        return queryData.queryLocal(ReqCtx.fromRequest(exchange.getRequest()), exchange, queryMono);
+        totalDataRequests.getAndAdd(1);
+        return queryData.queryLocal(ReqCtx.fromRequest(exchange), exchange, queryMono);
     }
 
     @PostMapping(path = "/api/1/rng", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> rng(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
         final int N = 64 * 1024;
         byte[] load = new byte[N];
-        DataBufferFactory bufFac = defaultDataBufferFactory;
+        DataBufferFactory bufFac = exchange.getResponse().bufferFactory();
         Flux<DataBuffer> mret = queryMono
         .doOnError(x -> LOGGER.info("can not parse request"))
         .flatMapMany(query -> Flux.generate(() -> 0L, (st, si) -> {
@@ -167,14 +199,40 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
         return Mono.just(ResponseEntity.ok().contentType(MediaType.APPLICATION_OCTET_STREAM).body(mret));
     }
 
+    @GetMapping(path = "/api/1/rngB/{seed}/{rate}", produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
+    public ResponseEntity<Flux<ByteBuffer>> rngB(ServerWebExchange exchange, @PathVariable int seed, @PathVariable int rate) {
+        final int N = 32;
+        int[] state = new int[] { seed, 0 };
+        Flux<ByteBuffer> fl = Flux.range(0, 1024 * 1024 * 1024)
+        .map(n -> {
+            ByteBuffer bb = ByteBuffer.allocate(N);
+            for (int i = 0; i < N; i += 1) {
+                int h = state[0];
+                bb.put((byte) h);
+                h ^= h << 13;
+                h ^= h >> 17;
+                h ^= h << 5;
+                state[0] = h;
+                state[1] += 1;
+            }
+            bb.flip();
+            return bb;
+        })
+        .transform(k -> Throttle.throttleByteBuffer(k, rate, 16, 100, 100))
+        .doOnNext(k -> QueryData.totalBytesEmitted.getAndAdd(k.remaining()));
+        return ResponseEntity.ok().contentType(MediaType.APPLICATION_OCTET_STREAM).body(fl);
+    }
+
     @PostMapping(path = "/api/1/rawLocal", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> rawLocal(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        return queryData.rawLocal(ReqCtx.fromRequest(exchange.getRequest(), false), exchange, queryMono);
+        totalDataRequests.getAndAdd(1);
+        return queryData.rawLocal(ReqCtx.fromRequest(exchange, false), exchange, queryMono);
     }
 
     @PostMapping(path = "/api/1/queryMergedLocal", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> queryMergedLocalOctets(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        return queryData.queryMergedOctetsLocal(ReqCtx.fromRequest(exchange.getRequest()), exchange, queryMono);
+        totalDataRequests.getAndAdd(1);
+        return queryData.queryMergedOctetsLocal(ReqCtx.fromRequest(exchange), queryMono);
     }
 
     @PostMapping(path = "/api/1/queryJson", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
@@ -184,18 +242,19 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
 
     @PostMapping(path = "/api/1/queryMergedJson", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> queryMergedJson(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        return queryData.queryMergedJson(ReqCtx.fromRequest(exchange.getRequest()), exchange, queryMono);
+        totalDataRequests.getAndAdd(1);
+        return queryData.queryMergedJson(ReqCtx.fromRequest(exchange), exchange, queryMono);
     }
 
     Flux<DataBuffer> channelsJson(DataBufferFactory bufFac, ChannelSearchQuery q, boolean configOut) {
         return Flux.generate(() -> ChannelLister.create(conf, bufFac, q.order(), q.regex, q.sourceRegex, q.descriptionRegex, configOut), ChannelLister::generate, ChannelLister::release)
         .subscribeOn(dbsched)
-        .flatMapIterable(Function.identity());
+        .concatMapIterable(Function.identity(), 1);
     }
 
     @GetMapping(path = "/api/1/channels", produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> channelsGet(ServerWebExchange exchange) {
-        ReqCtx reqctx = ReqCtx.fromRequest(exchange.getRequest());
+        ReqCtx reqctx = ReqCtx.fromRequest(exchange);
         LOGGER.debug("{}  request for channelsGet", reqctx);
         ChannelSearchQuery q = new ChannelSearchQuery();
         q.ordering = "asc";
@@ -211,7 +270,7 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
 
     @GetMapping(path = "/api/1/channels/search/regexp/{regexp}", produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> channelsGet(ServerWebExchange exchange, @PathVariable String regexp) {
-        ReqCtx reqctx = ReqCtx.fromRequest(exchange.getRequest());
+        ReqCtx reqctx = ReqCtx.fromRequest(exchange);
         LOGGER.info("{}  request for channelsRegexp  [{}]", reqctx, regexp);
         ChannelSearchQuery q = new ChannelSearchQuery();
         q.ordering = "asc";
@@ -226,7 +285,7 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
 
     @PostMapping(path = "/api/1/channels", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> channelsPost(ServerWebExchange exchange, @RequestBody Mono<ChannelSearchQuery> queryMono) {
-        ReqCtx reqctx = ReqCtx.fromRequest(exchange.getRequest());
+        ReqCtx reqctx = ReqCtx.fromRequest(exchange);
         LOGGER.debug("{}  request for channelsPost", reqctx);
         return queryMono.map(query -> {
             if (!query.valid()) {
@@ -245,7 +304,7 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
 
     @PostMapping(path = "/api/1/channels/config", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> channelsConfigPost(ServerWebExchange exchange, @RequestBody Mono<ChannelSearchQuery> queryMono) {
-        ReqCtx reqctx = ReqCtx.fromRequest(exchange.getRequest());
+        ReqCtx reqctx = ReqCtx.fromRequest(exchange);
         LOGGER.info("{}  request for channelsPost", reqctx);
         return queryMono.map(query -> {
             if (!query.valid()) {
@@ -274,13 +333,13 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
 
     public static void logHeaders(ServerWebExchange ex) {
         for (String n : List.of("User-Agent", "X-PythonDataAPIPackageVersion", "X-PythonDataAPIModule")) {
-            LOGGER.info("{}  header {} {}", ReqCtx.fromRequest(ex.getRequest()), n, ex.getRequest().getHeaders().get(n));
+            LOGGER.info("{}  header {} {}", ReqCtx.fromRequest(ex), n, ex.getRequest().getHeaders().get(n));
         }
     }
 
     @GetMapping(path = "/api/1/requestStatus/{reqid}", produces = MediaType.APPLICATION_JSON_VALUE)
     public RequestStatus requestStatus(ServerWebExchange ex, @PathVariable String reqid) {
-        LOGGER.debug("{}  requestStatus  reqid {}", ReqCtx.fromRequest(ex.getRequest()), reqid);
+        LOGGER.debug("{}  requestStatus  reqid {}", ReqCtx.fromRequest(ex), reqid);
         return queryData.requestStatusBoard().get(reqid);
     }
 
@@ -311,52 +370,28 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
 
     ConfigurationRetrieval loadConfiguration(File f1) throws IOException {
         ObjectMapper mapper = new ObjectMapper(new JsonFactory());
-        ConfigurationRetrieval conf = mapper.readValue(f1, ConfigurationRetrieval.class);
-        if (conf.splitNodes != null) {
-            for (SplitNode sn : conf.splitNodes) {
-                if (sn.host == null) {
-                    sn.host = "localhost";
-                }
-                if (sn.port == 0) {
-                    sn.port = localPort;
-                }
-            }
-        }
-        return conf;
+        return mapper.readValue(f1, ConfigurationRetrieval.class);
     }
 
     ConfigurationRetrieval loadConfiguration(WebServerInitializedEvent ev) throws IOException {
-        if (configFile != null && !configFile.equals("UNDEFINED")) {
+        if (configFile != null) {
             LOGGER.info("try file: {}", configFile);
             File f1 = ResourceUtils.getFile(configFile);
             LOGGER.info("load from: {}", f1);
             return loadConfiguration(f1);
         }
         else {
-            try {
-                File f1 = ResourceUtils.getFile("classpath:retrieval.json");
-                LOGGER.info("load from: {}", f1);
-                return loadConfiguration(f1);
-            }
-            catch (Exception e) {
-                LOGGER.info("no default configFile found.");
-            }
+            return null;
         }
-        return null;
     }
 
     @Override
     public void onApplicationEvent(WebServerInitializedEvent ev) {
-        List<SplitNode> splitNodes = List.of();
         localPort = ev.getWebServer().getPort();
         try {
-            ConfigurationRetrieval conf = loadConfiguration(ev);
-            conf.validate();
-            LOGGER.info("loaded: {}", conf);
-            if (conf != null) {
-                this.conf = conf;
-                splitNodes = conf.splitNodes;
-            }
+            ConfigurationRetrieval c = loadConfiguration(ev);
+            c.validate();
+            conf = c;
         }
         catch (ConfigurationRetrieval.InvalidException e) {
             LOGGER.error("Invalid configuration: {}", e.toString());
@@ -364,19 +399,17 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
         catch (IOException e) {
             throw new RuntimeException(e);
         }
-        Hooks.onNextDropped(obj -> {
-            LOGGER.error("Hooks.onNextDropped  {}", obj);
-        });
+        Hooks.onNextDropped(obj -> QueryData.doDiscard("hooks_api1_0", obj));
+        Hooks.onNextDropped(obj -> QueryData.doDiscard("hooks_api1_1", obj));
         Hooks.onOperatorError((err, obj) -> {
-            LOGGER.error("Hooks.onOperatorError  {}", obj);
+            LOGGER.error("Hooks.onOperatorError  {}  {}", err, obj);
+            QueryData.doDiscard("Hooks.onOperatorError", obj);
             return err;
         });
-        LOGGER.info("localPort {}  dataBaseDir {}", localPort, dataBaseDir);
-        queryData = new QueryData(new BaseDirFinderFormatV0(Path.of(dataBaseDir), baseKeyspaceName), splitNodes, canonicalHostname);
-    }
-
-    public long getTotalBytesServed() {
-        return queryData.totalBytesServed.get();
+        LOGGER.info("canonicalHostname {}  localPort {}  databufferBaseDir {}  databufferKeyspacePrefix {}", conf.canonicalHostname, localPort, conf.databufferBaseDir, conf.databufferKeyspacePrefix);
+        queryData = new QueryData(new BaseDirFinderFormatV0(Path.of(conf.databufferBaseDir), conf.databufferKeyspacePrefix), conf);
+        queryData.port = localPort;
+        new RawSub(queryData).rawTcp();
     }
 
 }

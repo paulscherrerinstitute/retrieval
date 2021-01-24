@@ -1,5 +1,6 @@
 package ch.psi.daq.retrieval;
 
+import ch.psi.daq.retrieval.controller.QueryData;
 import com.google.common.io.BaseEncoding;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,7 +12,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 
 public class Index {
-    static Logger LOGGER = LoggerFactory.getLogger("Index");
+    static final Logger LOGGER = LoggerFactory.getLogger(Index.class.getSimpleName());
     static final int N = 16;
 
     static class FindResult {
@@ -33,7 +34,7 @@ public class Index {
             return ret;
         }
         public boolean isSome() {
-            return k > 0;
+            return k >= 0;
         }
         @Override
         public String toString() {
@@ -102,13 +103,20 @@ public class Index {
 
     static Mono<byte[]> openIndex(Path indexPath) {
         return Mono.fromCallable(() -> {
-            LOGGER.info("BEGIN openIndex {}", indexPath);
+            //LOGGER.info("BEGIN openIndex {}", indexPath);
             long fileSize = Files.size(indexPath);
-            if (fileSize > 20 * 1024 * 1024) {
-                LOGGER.warn(String.format("Index file is large  size %d  path %s", fileSize, indexPath));
-            }
-            if (fileSize > 200 * 1024 * 1024) {
+            if (fileSize > 1024 * 1024 * 200) {
+                QueryData.indexSizeHuge.getAndAdd(1);
                 throw new RuntimeException(String.format("Index file is too large  size %d  this may indicate a problem with the channel data  path %s", fileSize, indexPath));
+            }
+            else if (fileSize > 1024 * 1024 * 50) {
+                QueryData.indexSizeLarge.getAndAdd(1);
+            }
+            else if (fileSize > 1024 * 1024 * 16) {
+                QueryData.indexSizeMedium.getAndAdd(1);
+            }
+            else {
+                QueryData.indexSizeSmall.getAndAdd(1);
             }
             byte[] b1 = Files.readAllBytes(indexPath);
             int n = b1.length;
@@ -119,7 +127,7 @@ public class Index {
                 throw new RuntimeException(String.format("unexpected index file content  n: %d  %s", n, indexPath));
             }
             byte[] ret = Arrays.copyOfRange(b1, 2, n);
-            LOGGER.info("DONE  openIndex {}", indexPath);
+            //LOGGER.info("DONE  openIndex {}", indexPath);
             return ret;
         });
     }

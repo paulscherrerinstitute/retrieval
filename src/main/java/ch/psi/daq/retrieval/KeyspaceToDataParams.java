@@ -14,9 +14,8 @@ public class KeyspaceToDataParams {
     public DataBufferFactory bufFac;
     public int bufferSize;
     public List<Integer> splits;
-    public ServerHttpRequest req;
     public ReqCtx reqctx;
-    public KeyspaceToDataParams(ReqCtx reqctx, KeyspaceOrder2 ksp, Instant begin, Instant end, DataBufferFactory bufFac, int bufferSize, List<Integer> splits, ServerHttpRequest req) {
+    public KeyspaceToDataParams(ReqCtx reqctx, KeyspaceOrder2 ksp, Instant begin, Instant end, DataBufferFactory bufFac, int bufferSize, List<Integer> splits) {
         this.reqctx = reqctx;
         this.ksp = ksp;
         this.begin = begin;
@@ -24,6 +23,5 @@ public class KeyspaceToDataParams {
         this.bufFac = bufFac;
         this.bufferSize = bufferSize;
         this.splits = splits;
-        this.req = req;
     }
 }

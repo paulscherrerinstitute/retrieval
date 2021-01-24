@@ -1,6 +1,5 @@
 package ch.psi.daq.retrieval.config;
 
-import ch.psi.daq.retrieval.SplitNode;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -17,11 +16,14 @@ public class ConfigurationRetrieval {
         }
     }
 
-    public List<SplitNode> splitNodes;
+    public List<Node> nodes;
     public boolean mergeLocal;
+    public List<Integer> splits;
     public ConfigurationDatabase database;
     public String backend;
-    public ProxyBackends proxyBackends;
+    public String canonicalHostname;
+    public String databufferBaseDir;
+    public String databufferKeyspacePrefix;
 
     @Override
     public String toString() {

@@ -3,6 +3,7 @@ package ch.psi.daq.retrieval.eventmap.value;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferFactory;
 import org.springframework.core.io.buffer.DataBufferUtils;
+import org.springframework.lang.NonNull;
 
 import java.io.OutputStream;
 import java.util.ArrayList;
@@ -38,7 +39,7 @@ public class OutputBuffer extends OutputStream {
     }
 
     @Override
-    public void write(byte[] ba, int off, int len) {
+    public void write(@NonNull byte[] ba, int off, int len) {
         if (buf == null) {
             buf = bufFac.allocateBuffer(bufferSize);
         }
