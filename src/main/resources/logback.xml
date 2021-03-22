@@ -1,4 +1,21 @@
 <configuration>
+    <appender name="rolling-warn" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+            <level>WARN</level>
+        </filter>
+        <file>warn.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>warn-%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <!-- max size per file, max days history,  -->
+            <maxFileSize>20MB</maxFileSize>
+            <maxHistory>200</maxHistory>
+            <totalSizeCap>200MB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <charset>UTF-8</charset>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS, UTC} Z [%thread] %-5level %logger{35} - %msg%n</pattern>
+        </encoder>
+    </appender>
     <appender name="rolling-info" class="ch.qos.logback.core.rolling.RollingFileAppender">
         <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
             <level>INFO</level>
@@ -31,6 +48,7 @@
         </encoder>
     </appender>
     <root level="INFO">
+        <appender-ref ref="rolling-warn" />
         <appender-ref ref="rolling-info" />
         <appender-ref ref="rolling-debug" />
     </root>

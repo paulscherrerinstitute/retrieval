@@ -31,6 +31,10 @@ public class MapJsonResult {
         return term;
     }
 
+    public boolean notTerm() {
+        return !term;
+    }
+
     public void release() {
         if (items != null) {
             for (MapJsonItem item : items) {

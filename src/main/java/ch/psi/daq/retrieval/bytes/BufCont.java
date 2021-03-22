@@ -7,11 +7,13 @@ import org.slf4j.LoggerFactory;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferFactory;
 import org.springframework.core.io.buffer.DataBufferUtils;
+import org.springframework.core.io.buffer.DefaultDataBufferFactory;
 import reactor.core.publisher.Mono;
 
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.lang.ref.Cleaner;
+import java.nio.CharBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -23,6 +25,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 import java.util.stream.LongStream;
 
 public class BufCont implements AutoCloseable, Releasable {
@@ -45,6 +48,9 @@ public class BufCont implements AutoCloseable, Releasable {
     static final Cleaner cleaner = Cleaner.create();
     static final AtomicLong idCount = new AtomicLong();
     static final AtomicLong gcCount = new AtomicLong();
+    static final AtomicLong takeButClosed = new AtomicLong();
+    static final AtomicLong takeButEmpty = new AtomicLong();
+    static final AtomicLong takeClosedNotEmpty = new AtomicLong();
 
     static class Inner implements Runnable {
         DataBuffer buf;
@@ -87,6 +93,9 @@ public class BufCont implements AutoCloseable, Releasable {
         public long closeCapMismatchCount;
         public long closeCapMismatchBytes;
         public long gcCount;
+        public long takeButClosed;
+        public long takeButEmpty;
+        public long takeClosedNotEmpty;
         public Stats() {
             errorCount = BufCont.errorCount.get();
             againClosedCount = BufCont.againClosedCount.get();
@@ -107,6 +116,9 @@ public class BufCont implements AutoCloseable, Releasable {
             closeCapMismatchCount = BufCont.closeCapMismatchCount.get();
             closeCapMismatchBytes = BufCont.closeCapMismatchBytes.get();
             gcCount = BufCont.gcCount.get();
+            takeButClosed = BufCont.takeButClosed.get();
+            takeButEmpty = BufCont.takeButEmpty.get();
+            takeClosedNotEmpty = BufCont.takeClosedNotEmpty.get();
         }
     }
 
@@ -117,20 +129,25 @@ public class BufCont implements AutoCloseable, Releasable {
         CLONED_EMPTY,
         Flatten,
         FlattenPassOn,
-        MERGER_SUPPORT_ITEM_VEC_01,
+        msiv1,
         ITEM_VEC_VGEN,
         ITEM_VEC_TFL,
         ITEM_VEC_IB_CTOR,
+        MtivIFlA,
+        MtivTB1,
+        MtivTB2,
         SUB_IN_CAN_REL,
         SUB_IN,
         SUB_OUT_NEXT,
-        QUERY_DATA_RAW_LOCAL_01,
-        QUERY_DATA_RAW_LOCAL_02,
+        qdrl1,
+        qdrl2,
+        qdrl3,
+        qdrl4,
+        qdrl7,
         MERGER_FAKE,
-        BUILD_MERGED_FROM_SUBQUERY,
+        BuildMergedAfterSub,
         QUERY_DATA_MERGED_01,
         QUERY_DATA_MERGED_02,
-        QUERY_DATA_MERGED_04,
         TransMapQueryMerged_01,
         TransMapQueryMerged_02,
         MapTs_trans2,
@@ -148,6 +165,28 @@ public class BufCont implements AutoCloseable, Releasable {
         JsMap_init,
         JsMap_init_2nd,
         TestA,
+        MapBasicBufBegin,
+        PreChanConf,
+        SprWebCl,
+        SprTest,
+        RawCl1,
+        RawCl2,
+        RawSub1,
+        RawSub2,
+        SubTools1,
+        SubTools2,
+        SubTools3,
+        SubToolsBuf,
+        Parts1,
+        Parts2,
+        PartsNextDIS,
+        mergeItemVecFluxesA,
+        mergeItemVecFluxesB,
+        OcLo1,
+        OcLo2,
+        OcLo3,
+        Acc1,
+        Acc2,
     }
 
     public static final boolean doMark = true;
@@ -332,7 +371,13 @@ public class BufCont implements AutoCloseable, Releasable {
 
     public synchronized Optional<DataBuffer> takeBuf() {
         if (closed > 0) {
-            throw new RuntimeException("logic");
+            if (hasBuf()) {
+                takeClosedNotEmpty.getAndAdd(1);
+            }
+            else {
+                takeButClosed.getAndAdd(1);
+            }
+            return Optional.empty();
         }
         close1();
         take1();
@@ -358,6 +403,7 @@ public class BufCont implements AutoCloseable, Releasable {
             openedClosedBytes.getAndAdd(-cap);
         }
         else {
+            takeButEmpty.getAndAdd(1);
             if (cleanable != null) {
                 throw new NoBufferException("takeBuf:empty");
             }
@@ -398,7 +444,11 @@ public class BufCont implements AutoCloseable, Releasable {
             return ret;
         }
         else {
-            BufCont ret = fromBuffer(DataBufferUtils.retain(bufferRef()), Mark.__NOMARK);
+            DataBuffer b1 = bufferRef();
+            DataBuffer b2 = b1.retainedSlice(0, b1.capacity());
+            b2.readPosition(b1.readPosition());
+            b2.writePosition(b1.writePosition());
+            BufCont ret = fromBuffer(b2, Mark.__NOMARK);
             ret.appendMarks(this);
             ret.appendMark(Mark.CLONED_FROM);
             ret.appendMark(mark);
@@ -416,6 +466,10 @@ public class BufCont implements AutoCloseable, Releasable {
         }
     }
 
+    public boolean closed() {
+        return closed != 0;
+    }
+
     public static String listOpen() {
         synchronized (allEver) {
             ByteArrayOutputStream os = new ByteArrayOutputStream();
@@ -429,7 +483,7 @@ public class BufCont implements AutoCloseable, Releasable {
                 allEver.forEach(Long.MAX_VALUE, (bid, bc) -> {
                     if (bc.closed == 0 && bc.inner != null && bc.inner.buf != null) {
                         if (printedTraces.getAndAdd(1) < 3) {
-                            ps.format("!!!!!!!!!!!!!!!!!!\nBufCont name: %s\nCREATED AT:\n", bc.nameToString());
+                            ps.format("!!!!!!!!!!!!!!!!!!\nBufCont name: %s\nCREATED AT:\n", bc.marksToString());
                             if (bc.eCtor != null) {
                                 ps.flush();
                                 bc.eCtor.printStackTrace(ps);
@@ -452,12 +506,13 @@ public class BufCont implements AutoCloseable, Releasable {
             AtomicInteger openNotMarkedCount = new AtomicInteger();
             allEver.forEach(Long.MAX_VALUE, (bid, bc) -> {
                 int cap = -1;
-                if (bc.inner != null) {
+                BufCont.Inner inner = bc.inner;
+                if (inner != null) {
                     cap = -2;
-                    if (bc.inner.buf != null) {
-                        cap = bc.inner.buf.capacity();
+                    if (inner.buf != null) {
+                        cap = inner.buf.capacity();
                     }
-                    if (!bc.inner.mark) {
+                    if (!inner.mark) {
                         openNotMarkedCount.getAndAdd(1);
                     }
                 }
@@ -469,7 +524,7 @@ public class BufCont implements AutoCloseable, Releasable {
                 }
                 if (true || bc.closed == 0) {
                     long age = (System.nanoTime() - bc.ts) / 1000 / 1000 / 1000;
-                    ps.format("id %19d  name %s  closed %2d  taken %2d  cap %6d  age %6d\n", bc.id, bc.nameToString(), bc.closed, bc.taken, cap, age);
+                    ps.format("id %19d  name %s  closed %2d  taken %2d  cap %6d  age %6d\n", bc.id, bc.marksToString(), bc.closed, bc.taken, cap, age);
                 }
             });
             ps.format("allEver.size %d\n", allEver.size());
@@ -492,7 +547,6 @@ public class BufCont implements AutoCloseable, Releasable {
         }
         int n = marks.length;
         markHist = new AtomicLongArray(n * n);
-        LOGGER.info("initMarkHist done");
     }
 
     public static List<String> markValues() {
@@ -582,7 +636,25 @@ public class BufCont implements AutoCloseable, Releasable {
         }
     }
 
-    public String nameToString() {
+    public static BufCont fromString(CharBuffer s) {
+        BufCont bc = BufCont.allocate(DefaultDataBufferFactory.sharedInstance, s.length() + 32, BufCont.Mark.__NOMARK);
+        bc.bufferRef().write(s, StandardCharsets.UTF_8);
+        return bc;
+    }
+
+    public static BufCont fromString(StringBuilder s) {
+        BufCont bc = BufCont.allocate(DefaultDataBufferFactory.sharedInstance, s.length() + 32, BufCont.Mark.__NOMARK);
+        bc.bufferRef().write(s, StandardCharsets.UTF_8);
+        return bc;
+    }
+
+    public static BufCont fromString(String s) {
+        BufCont bc = BufCont.allocate(DefaultDataBufferFactory.sharedInstance, s.length() + 32, BufCont.Mark.__NOMARK);
+        bc.bufferRef().write(s, StandardCharsets.UTF_8);
+        return bc;
+    }
+
+    public String marksToString() {
         StringBuilder sb = new StringBuilder();
         int beg = 0;
         int n1 = markCount;
@@ -600,6 +672,42 @@ public class BufCont implements AutoCloseable, Releasable {
 
     public void releaseFinite() {
         close();
+    }
+
+    static List<String> hexFrag;
+    static {
+        hexFrag = IntStream.range(0, 256).boxed().map(k -> String.format("%02x", k)).collect(Collectors.toList());
+    }
+
+    public static StringBuilder dumpContent(DataBuffer buf) {
+        return dumpContent(buf, 0);
+    }
+
+    public static StringBuilder dumpContent(BufCont bc) {
+        if (bc.hasBuf()) {
+            DataBuffer buf = bc.bufferRef();
+            return dumpContent(buf, 0);
+        }
+        else {
+            return new StringBuilder("[BufCont empty]");
+        }
+    }
+
+    public static StringBuilder dumpContent(DataBuffer buf, int nnnn) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("cap %d  rp %d  wp %d\n", buf.capacity(), buf.readPosition(), buf.writePosition()));
+        int i1;
+        for (i1 = buf.readPosition(); i1 < buf.writePosition(); i1 += 1) {
+            int p = 0xff & buf.getByte(i1);
+            sb.append(hexFrag.get(p)).append(" ");
+            if (i1 % 16 == 15) {
+                sb.append("\n");
+            }
+        }
+        if (i1 % 16 != 0) {
+            sb.append("\n");
+        }
+        return sb;
     }
 
 }

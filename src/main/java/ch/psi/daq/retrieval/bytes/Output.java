@@ -18,12 +18,6 @@ public class Output {
         startNew();
     }
 
-    BufCont.Mark mark;
-    DataBufferFactory bufFac;
-    int bufferSize;
-    BufCont cbufcont;
-    List<BufCont> bufs = new ArrayList<>();
-
     public DataBuffer bufferRef() {
         return cbufcont.bufferRef();
     }
@@ -43,11 +37,16 @@ public class Output {
     }
 
     public void ensureWritable(int n) {
-        if (cbufcont.bufferRef().writableByteCount() < n) {
+        if (cbufcont == null) {
             startNew();
         }
-        if (cbufcont.bufferRef().writableByteCount() < n) {
-            throw new RuntimeException("logic");
+        else {
+            if (cbufcont.bufferRef().writableByteCount() < n) {
+                startNew();
+            }
+            if (cbufcont.bufferRef().writableByteCount() < n) {
+                throw new RuntimeException("logic");
+            }
         }
     }
 
@@ -71,17 +70,34 @@ public class Output {
     }
 
     public List<BufCont> take() {
-        if (cbufcont != null && cbufcont.readableByteCount() > 0) {
-            bufs.add(cbufcont);
-            cbufcont = null;
-        }
-        else {
-            BufCont b = cbufcont;
-            cbufcont = null;
-            b.close();
+        if (cbufcont != null) {
+            if (cbufcont.readableByteCount() > 0) {
+                bufs.add(cbufcont);
+                cbufcont = null;
+            }
+            else {
+                BufCont b = cbufcont;
+                cbufcont = null;
+                b.close();
+            }
         }
         List<BufCont> ret = bufs;
-        bufs = null;
+        bufs = new ArrayList<>();
         return ret;
     }
+
+    public void release() {
+        take().forEach(BufCont::close);
+    }
+
+    public int queuedCount() {
+        return bufs.size();
+    }
+
+    final BufCont.Mark mark;
+    final DataBufferFactory bufFac;
+    final int bufferSize;
+    BufCont cbufcont;
+    List<BufCont> bufs = new ArrayList<>();
+
 }

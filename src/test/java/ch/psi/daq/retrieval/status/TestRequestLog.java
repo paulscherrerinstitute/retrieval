@@ -1,6 +1,6 @@
 package ch.psi.daq.retrieval.status;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.time.ZonedDateTime;
 
@@ -9,7 +9,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 public class TestRequestLog {
 
     RequestStatusBoard makeFilledBoard() {
-        RequestStatusBoard board = new RequestStatusBoard();
+        // TODO rsb parameter
+        RequestStatusBoard board = new RequestStatusBoard(null);
         for (int i1 = 0; i1 < 10; i1 += 1) {
             ZonedDateTime dt = ZonedDateTime.parse("2020-02-01T00:00:00Z").plusMinutes(i1);
             RequestStatus st = new RequestStatus();

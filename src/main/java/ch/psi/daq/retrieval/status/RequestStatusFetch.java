@@ -1,6 +1,6 @@
 package ch.psi.daq.retrieval.status;
 
-import ch.psi.daq.retrieval.ReqCtx;
+import ch.psi.daq.retrieval.reqctx.ReqCtx;
 import ch.qos.logback.classic.Logger;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.LoggerFactory;
@@ -14,14 +14,13 @@ import java.nio.charset.StandardCharsets;
 public class RequestStatusFetch {
     static final Logger LOGGER = (Logger) LoggerFactory.getLogger(RequestStatusFetch.class.getSimpleName());
 
-    public static Mono<Void> getRequestStatus(RequestStatusBoard requestStatusBoard, ReqCtx reqCtx, String host, int port, String reqId) {
-        //LOGGER.info("{}  getRequestStatus  from {}", reqCtx, host);
+    public static Mono<RequestStatusResult> getRequestStatus(RequestStatusBoard requestStatusBoard, ReqCtx reqCtx, String host, int port, String reqId) {
         String requestStatusUrl = String.format("http://%s:%d/api/1/requestStatus/%s", host, port, reqId);
         return WebClient.create().get().uri(requestStatusUrl)
         .exchangeToMono(res -> {
             if (res.statusCode() != HttpStatus.OK) {
                 LOGGER.error("{}  getRequestStatus  for remote req {}  got http status {}", reqCtx, reqId, res.statusCode());
-                RequestStatus.Error e = new RequestStatus.Error(String.format("http %s", res.statusCode()));
+                Error e = new Error(String.format("error in getRequestStatus http status %s from %s:%d", res.statusCode().toString(), host, port));
                 return Mono.just(new RequestStatusResult(e));
             }
             return res.bodyToMono(ByteBuffer.class)
@@ -32,13 +31,17 @@ public class RequestStatusFetch {
                 }
                 catch (Throwable e2) {
                     LOGGER.error("{}  getRequestStatus  for {}  can not parse  {}  {}", reqCtx, reqId, e2.toString(), s1);
-                    RequestStatus.Error e = new RequestStatus.Error("parse error");
+                    Error e = new Error(e2, "parse error");
                     return new RequestStatusResult(e);
                 }
-            });
+            })
+            .doOnError(e -> {
+                LOGGER.error("{}  error A from WebClient getRequestStatus  from {}:{}  emsg {}", reqCtx, host, port, e.getMessage());
+            })
+            .onErrorResume(e -> Mono.empty());
         })
         .doOnError(e -> {
-            LOGGER.error("{}  error from WebClient getRequestStatus  from {}", reqCtx, host);
+            LOGGER.error("{}  error B from WebClient getRequestStatus  from {}:{}  emsg {}", reqCtx, host, port, e.getMessage());
         })
         .onErrorResume(e -> Mono.empty())
         .doOnNext(k -> {
@@ -52,8 +55,7 @@ public class RequestStatusFetch {
             else {
                 LOGGER.error("unhandled status type");
             }
-        })
-        .then();
+        });
     }
 
 }

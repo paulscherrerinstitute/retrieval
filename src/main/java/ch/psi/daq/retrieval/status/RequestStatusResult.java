@@ -7,7 +7,7 @@ public class RequestStatusResult {
         requestStatus = k;
     }
 
-    RequestStatusResult(RequestStatus.Error e) {
+    RequestStatusResult(Error e) {
         ty = RequestStatusResultType.Error;
         error = e;
     }
@@ -23,7 +23,7 @@ public class RequestStatusResult {
     public RequestStatus status() {
         return requestStatus;
     }
-    public RequestStatus.Error error() {
+    public Error error() {
         return error;
     }
 
@@ -34,6 +34,6 @@ public class RequestStatusResult {
 
     RequestStatusResultType ty;
     RequestStatus requestStatus;
-    RequestStatus.Error error;
+    Error error;
 
 }

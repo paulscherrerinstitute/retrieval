@@ -1,9 +1,10 @@
 package ch.psi.daq.retrieval.eventmap.value;
 
 import ch.psi.bitshuffle.BitShuffleLZ4JNIDecompressor;
-import ch.psi.daq.retrieval.DTypeBitmapUtils;
+import ch.psi.daq.retrieval.reqctx.BufCtx;
+import ch.psi.daq.retrieval.utils.DTypeBitmapUtils;
 import ch.psi.daq.retrieval.QueryParams;
-import ch.psi.daq.retrieval.ReqCtx;
+import ch.psi.daq.retrieval.reqctx.ReqCtx;
 import ch.psi.daq.retrieval.bytes.BufCont;
 import ch.psi.daq.retrieval.bytes.Output;
 import ch.psi.daq.retrieval.merger.Releasable;
@@ -40,6 +41,7 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
     static final AtomicLong applyDespiteTerm = new AtomicLong();
     static final AtomicLong applyEmptyBuffer = new AtomicLong();
     static final AtomicLong leftWithoutBuf = new AtomicLong();
+    static final AtomicLong pulseGapCount = new AtomicLong();
     DataBufferFactory bufFac;
     BufCont kbufcont = BufCont.makeEmpty(BufCont.Mark.V1Map_init);
     BufCont leftbufcont;
@@ -54,13 +56,18 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
     int blobsArray = -1;
     int blobsShape = -1;
     int blobsCompression = -1;
-    int shapeDims;
+    int shapeDims = -1;
+    int[] shapeLens;
+    int shapeDimsHeader;
+    int[] shapeLensHeader = new int[4];
     int missingBytes;
     int valueBytes;
-    int[] shapeLens = new int[4];
     ByteOrder blobsByteOrder = null;
     long pulse;
     long ts;
+    boolean detectedUnordered;
+    long tsLast = Long.MIN_VALUE;
+    long pulseLast = Long.MIN_VALUE;
     int blobLength;
     int headerLength;
     int optionalFieldsLength;
@@ -72,6 +79,8 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
     long writtenBytes;
     long seenHeaderA;
     ReqCtx reqctx;
+    int dtNum = Integer.MIN_VALUE;
+    int dtFlags = Integer.MIN_VALUE;
     AtomicInteger released = new AtomicInteger();
 
     enum State {
@@ -106,6 +115,7 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
         public long applyDespiteTerm;
         public long applyEmptyBuffer;
         public long leftWithoutBuf;
+        public long pulseGapCount;
         public long resultTakenEmpty;
         public Stats() {
             leftCopiedTimes = EventBlobToV1Map.leftCopiedTimes.get();
@@ -114,6 +124,7 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
             applyDespiteTerm = EventBlobToV1Map.applyDespiteTerm.get();
             applyEmptyBuffer = EventBlobToV1Map.applyEmptyBuffer.get();
             leftWithoutBuf = EventBlobToV1Map.leftWithoutBuf.get();
+            pulseGapCount = EventBlobToV1Map.pulseGapCount.get();
             resultTakenEmpty = EventBlobMapResult.takenEmpty.get();
         }
     }
@@ -132,8 +143,8 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
         this.needMin = HEADER_A_LEN;
     }
 
-    public static Flux<EventBlobMapResult> trans(ReqCtx reqctx, Flux<BufCont> fl, String channelName, long endNanos, DataBufferFactory bufFac, int bufferSize, QueryParams qp) {
-        final EventBlobToV1Map mapper = new EventBlobToV1Map(reqctx, channelName, endNanos, bufFac, bufferSize, qp);
+    public static Flux<EventBlobMapResult> trans(ReqCtx reqctx, Flux<BufCont> fl, String channelName, long endNanos, BufCtx bufCtx, QueryParams qp) {
+        final EventBlobToV1Map mapper = new EventBlobToV1Map(reqctx, channelName, endNanos, bufCtx.bufFac, bufCtx.bufferSize, qp);
         return fl.map(mapper)
         .concatWith(Mono.defer(() -> Mono.just(mapper.lastResult())))
         .takeWhile(EventBlobMapResult::notTerm)
@@ -289,6 +300,17 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
             state = State.TERM;
             return;
         }
+        if (tsLast != Long.MIN_VALUE && ts < tsLast) {
+            if (!detectedUnordered) {
+                LOGGER.error("unordered ts  {}  {}  in {}", ts, tsLast, channelName);
+                detectedUnordered = true;
+            }
+        }
+        if (pulseLast != Long.MIN_VALUE && pulseLast + 1 != pulse) {
+            pulseGapCount.getAndAdd(1);
+        }
+        tsLast = ts;
+        pulseLast = pulse;
         int optionalFieldsLength = bb.getInt();
         if (optionalFieldsLength < -1 || optionalFieldsLength == 0) {
             LOGGER.error("{}  unexpected value for optionalFieldsLength: {}", reqctx, optionalFieldsLength);
@@ -323,13 +345,27 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
         headerLength += needMin;
         bb.position(bb.position() + optionalFieldsLength);
         needMin = 0;
-        int dtypeBitmask = 0xffff & bb.getShort();
-        blobsType = 0xff & dtypeBitmask;
+        int j = 0xffff & bb.getShort();
+        int dtypeFlags = j >> 8;
+        int dtypeNum = 0xff & j;
+        if (dtNum == Integer.MIN_VALUE) {
+            dtNum = dtypeNum;
+            dtFlags = dtypeFlags;
+            blobsType = dtypeNum;
+        }
+        else {
+            if (dtypeNum != dtNum) {
+                throw new RuntimeException(String.format("change of dtNum  old %d  new %d", dtNum, dtypeNum));
+            }
+            if (dtypeFlags != dtFlags) {
+                throw new RuntimeException(String.format("change of dtFlags  old %d  new %d", dtFlags, dtypeFlags));
+            }
+        }
         if (blobsType > 13) {
             LOGGER.error("{}  unexpected datatype: {}", reqctx, blobsType);
             throw new RuntimeException("unexpected datatype");
         }
-        if ((dtypeBitmask & 0x8000) != 0) {
+        if ((dtypeFlags & 0x80) != 0) {
             if (blobsCompression != -1 && blobsCompression != 1) {
                 throw new RuntimeException("logic");
             }
@@ -346,7 +382,7 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
             blobUnpack = false;
             blobsCompression = 0;
         }
-        if ((dtypeBitmask & 0x4000) != 0) {
+        if ((dtypeFlags & 0x40) != 0) {
             if (blobsArray != -1 && blobsArray != 1) {
                 throw new RuntimeException("logic");
             }
@@ -358,7 +394,7 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
             }
             blobsArray = 0;
         }
-        if ((dtypeBitmask & 0x2000) != 0) {
+        if ((dtypeFlags & 0x20) != 0) {
             if (blobsByteOrder != null && blobsByteOrder != ByteOrder.BIG_ENDIAN) {
                 throw new RuntimeException("inhomogeneous endianness");
             }
@@ -370,7 +406,7 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
             }
             blobsByteOrder = ByteOrder.LITTLE_ENDIAN;
         }
-        if ((dtypeBitmask & 0x1000) != 0) {
+        if ((dtypeFlags & 0x10) != 0) {
             if (blobsShape != -1 && blobsShape != 1) {
                 throw new RuntimeException("logic");
             }
@@ -384,11 +420,11 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
             blobsShape = 0;
             shapeDims = 0;
         }
-        if (((dtypeBitmask & 0x4000) != 0) && ((dtypeBitmask & 0x1000) == 0)) {
+        if (((dtypeFlags & 0x40) != 0) && ((dtypeFlags & 0x10) == 0)) {
             //throw new RuntimeException("array without shape");
             // This is a writer bug. Lots of archived data already has this.
         }
-        if (((dtypeBitmask & 0x1000) != 0) && ((dtypeBitmask & 0x4000) == 0)) {
+        if (((dtypeFlags & 0x10) != 0) && ((dtypeFlags & 0x40) == 0)) {
             throw new RuntimeException("shape without array");
         }
         state = State.EXPECT_HEADER_C;
@@ -414,9 +450,17 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
             }
         }
         if (blobsShape == 1) {
-            shapeDims = 0xff & bb.get();
+            int n = 0xff & bb.get();
+            if (shapeDims == -1) {
+                shapeDims = n;
+                shapeDimsHeader = n;
+            }
+            else {
+                if (n != shapeDims) {
+                    throw new RuntimeException(String.format("change in shapeDims  old %d  new %d", shapeDims, n));
+                }
+            }
             needMin = shapeDims * Integer.BYTES;
-            //LOGGER.debug("{}  has shape, dims: {}", reqctx, shapeDims);
         }
         if (shapeDims > 3) {
             LOGGER.warn("{}  currentEvent.shapeDims  {}  {} > 3", reqctx, channelName, shapeDims);
@@ -435,9 +479,21 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
         }
         missingBytes = valueBytes;
         LOGGER.trace("{}  blobLength {}  headerLength {}  missing {}", reqctx, blobLength, headerLength, valueBytes);
-        for (int i = 0; i < shapeDims; i++) {
-            int n = bb.getInt();
-            shapeLens[i] = n;
+        if (shapeLens == null) {
+            shapeLens = new int[shapeDims];
+            for (int i = 0; i < shapeDims; i++) {
+                int n = bb.getInt();
+                shapeLens[i] = n;
+                shapeLensHeader[i] = n;
+            }
+        }
+        else {
+            for (int i = 0; i < shapeDims; i++) {
+                int n = bb.getInt();
+                if (n != shapeLens[i]) {
+                    throw new RuntimeException(String.format("shape change  i %d  old %d  new %d", i, shapeLens[i], n));
+                }
+            }
         }
         if (blobUnpack) {
             LOGGER.error("{}  blobUnpack not supported currently", reqctx);
@@ -488,8 +544,8 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
                     ByteBuffer src = buf.asByteBuffer(buf.readPosition(), 8);
                     int nf = (int) src.getLong();
                     //LOGGER.info("{}  nf {}  shapeDims {}  shapeLens {}", reqctx, nf, shapeDims, shapeLens);
-                    shapeDims = 1;
-                    shapeLens[0] = nf / sizeOf(blobsType);
+                    shapeDimsHeader = 1;
+                    shapeLensHeader[0] = nf / sizeOf(blobsType);
                 }
                 if (!headerOut) {
                     writeHeader(out, channelName);
@@ -664,10 +720,10 @@ public class EventBlobToV1Map implements Function<BufCont, EventBlobMapResult>, 
             }
             header.byteOrder = blobsByteOrder.toString();
             header.array = blobsArray == 1;
-            if (shapeDims > 0) {
+            if (shapeDimsHeader > 0) {
                 header.shape = new ArrayList<>();
-                for (int i = 0; i < shapeDims; i++) {
-                    header.shape.add(shapeLens[i]);
+                for (int i = 0; i < shapeDimsHeader; i++) {
+                    header.shape.add(shapeLensHeader[i]);
                 }
             }
         }

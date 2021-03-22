@@ -1,6 +1,7 @@
 package ch.psi.daq.retrieval.status;
 
-import ch.psi.daq.retrieval.ReqCtx;
+import ch.psi.daq.retrieval.config.ConfigurationRetrieval;
+import ch.psi.daq.retrieval.reqctx.ReqCtx;
 import ch.qos.logback.classic.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.SignalType;
@@ -34,47 +35,50 @@ public class RequestStatusBoard {
         }
     }
 
+    public RequestStatusBoard(ConfigurationRetrieval conf) {
+        this.conf = conf;
+    }
+
     public Stats stats() {
         return new Stats(this);
     }
 
-    Map<String, RequestStatus> map = new TreeMap<>();
-
     public synchronized RequestStatus get(String reqId) {
-        return map.get(reqId);
+        RequestStatus ret = map.get(reqId);
+        return ret;
     }
 
-    public synchronized void requestBegin(ReqCtx reqctx) {
-        map.put(reqctx.reqId, new RequestStatus(reqctx));
-    }
-
-    public synchronized void requestSubBegin(ReqCtx reqctx, String mainReqId) {
-        reqctx.mainReqId = mainReqId;
-        map.put(reqctx.reqId, new RequestStatus(reqctx));
-    }
-
-    public synchronized RequestStatus getOrCreate(ReqCtx reqctx) {
-        RequestStatus status = map.get(reqctx.reqId);
-        if (status == null) {
-            status = new RequestStatus(reqctx);
-            map.put(reqctx.reqId, status);
+    public synchronized RequestStatus getOrCreate(ReqCtx reqCtx) {
+        RequestStatus ret = map.get(reqCtx.reqId);
+        if (ret == null) {
+            ret = new RequestStatus(reqCtx);
+            map.put(reqCtx.reqId, ret);
         }
         else {
-            status.ping();
+            ret.ping();
         }
-        return status;
+        return ret;
     }
 
-    public synchronized void requestError(ReqCtx reqctx, Throwable e) {
-        getOrCreate(reqctx).addError(new RequestStatus.Error(String.format("%s", e.toString())));
+    public synchronized void requestBegin(ReqCtx reqCtx) {
+        getOrCreate(reqCtx);
     }
 
-    public synchronized void requestErrorChannelName(ReqCtx reqctx, String channelName, Throwable e) {
-        getOrCreate(reqctx).addError(new RequestStatus.Error(String.format("channel %s   %s", channelName, e.toString())));
+    public synchronized void requestSubBegin(ReqCtx reqCtx, String mainReqId) {
+        getOrCreate(reqCtx);
+        reqCtx.mainReqId = mainReqId;
     }
 
-    public synchronized void ping(ReqCtx reqctx) {
-        getOrCreate(reqctx).ping();
+    public synchronized void requestError(ReqCtx reqCtx, Throwable e) {
+        getOrCreate(reqCtx).addError(new Error(e));
+    }
+
+    public synchronized void requestErrorChannelName(ReqCtx reqCtx, String channelName, Throwable e) {
+        getOrCreate(reqCtx).addError(new Error(e, channelName));
+    }
+
+    public synchronized void ping(ReqCtx reqCtx) {
+        getOrCreate(reqCtx).ping();
     }
 
     public void bodyEmitted(ReqCtx reqCtx, SignalType sig) {
@@ -89,7 +93,7 @@ public class RequestStatusBoard {
         }
         reqCtx.bodyEmitted();
         ping(reqCtx);
-        LOGGER.info("RequestStatus bodyEmitted  sig {}  summary {}", sig, getOrCreate(reqCtx).summary());
+        LOGGER.debug("RequestStatus bodyEmitted  sig {}  summary {}", sig, getOrCreate(reqCtx).summary());
     }
 
     public synchronized int mapCount() {
@@ -141,5 +145,8 @@ public class RequestStatusBoard {
             return 0;
         }
     }
+
+    final Map<String, RequestStatus> map = new TreeMap<>();
+    public final ConfigurationRetrieval conf;
 
 }

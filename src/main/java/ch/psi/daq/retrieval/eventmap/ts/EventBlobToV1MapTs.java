@@ -1,10 +1,13 @@
 package ch.psi.daq.retrieval.eventmap.ts;
 
-import ch.psi.daq.retrieval.BufCtx;
-import ch.psi.daq.retrieval.ReqCtx;
+import ch.psi.daq.retrieval.controller.ItemFilter;
+import ch.psi.daq.retrieval.reqctx.BufCtx;
+import ch.psi.daq.retrieval.reqctx.ReqCtx;
 import ch.psi.daq.retrieval.bytes.BufCont;
 import ch.qos.logback.classic.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.Marker;
+import org.slf4j.MarkerFactory;
 import org.springframework.core.io.buffer.DataBuffer;
 import reactor.core.publisher.Flux;
 
@@ -29,6 +32,8 @@ public class EventBlobToV1MapTs implements Function<BufCont, MapTsItemVec> {
     static final AtomicLong inpCount = new AtomicLong();
     static final AtomicLong inpBytes = new AtomicLong();
     static final AtomicLong leftWithoutBuf = new AtomicLong();
+    static final AtomicLong pulseGapCount = new AtomicLong();
+    static final Marker markBufTrace = ItemFilter.markBufTrace;
     BufCont leftbufcont;
     State state;
     int needMin;
@@ -43,11 +48,14 @@ public class EventBlobToV1MapTs implements Function<BufCont, MapTsItemVec> {
     int inside;
     int bufBeg;
     String name;
-    ReqCtx reqctx;
+    ReqCtx reqCtx;
     boolean closed;
     boolean detectedUnordered;
     long tsLast = Long.MIN_VALUE;
     long pulseLast = Long.MIN_VALUE;
+    int trailingEventsMax;
+    int trailingEvents;
+    boolean countGaps;
 
     enum State {
         EXPECT_HEADER_A,
@@ -56,13 +64,15 @@ public class EventBlobToV1MapTs implements Function<BufCont, MapTsItemVec> {
         TERM,
     }
 
-    public EventBlobToV1MapTs(ReqCtx reqctx, String name, long endNanos, BufCtx bufctx) {
+    public EventBlobToV1MapTs(ReqCtx reqCtx, String name, long endNanos, int trailingEventsMax, BufCtx bufctx, boolean countGaps) {
         openCount.getAndAdd(1);
-        this.reqctx = reqctx;
+        this.reqCtx = reqCtx;
         this.name = name;
         this.endNanos = endNanos;
+        this.trailingEventsMax = trailingEventsMax;
         this.state = State.EXPECT_HEADER_A;
         this.needMin = HEADER_A_LEN;
+        this.countGaps = countGaps;
     }
 
     public static class Stats {
@@ -78,6 +88,7 @@ public class EventBlobToV1MapTs implements Function<BufCont, MapTsItemVec> {
         public long inpCount;
         public long inpBytes;
         public long leftWithoutBuf;
+        public long pulseGapCount;
         public Stats() {
             leftCopiedTimes = EventBlobToV1MapTs.leftCopiedTimes.get();
             leftCopiedBytes = EventBlobToV1MapTs.leftCopiedBytes.get();
@@ -91,14 +102,20 @@ public class EventBlobToV1MapTs implements Function<BufCont, MapTsItemVec> {
             inpCount = EventBlobToV1MapTs.inpCount.get();
             inpBytes = EventBlobToV1MapTs.inpBytes.get();
             leftWithoutBuf = EventBlobToV1MapTs.leftWithoutBuf.get();
+            pulseGapCount = EventBlobToV1MapTs.pulseGapCount.get();
         }
     }
 
-    public static Flux<MapTsItemVec> trans(ReqCtx reqctx, Flux<BufCont> fl, String name, String channelName, long endNanos, BufCtx bufctx) {
-        final EventBlobToV1MapTs mapper = new EventBlobToV1MapTs(reqctx, name, endNanos, bufctx);
+    public static Flux<MapTsItemVec> trans(ReqCtx reqCtx, Flux<BufCont> fl, String name, String channelName, long endNanos, int trailingEvents, BufCtx bufCtx) {
+        return trans(reqCtx, fl, name, channelName, endNanos, trailingEvents, bufCtx, false);
+    }
+
+    public static Flux<MapTsItemVec> trans(ReqCtx reqCtx, Flux<BufCont> fl, String name, String channelName, long endNanos, int trailingEvents, BufCtx bufCtx, boolean countGaps) {
+        final EventBlobToV1MapTs mapper = new EventBlobToV1MapTs(reqCtx, name, endNanos, trailingEvents, bufCtx, countGaps);
         return fl
         .doOnDiscard(BufCont.class, BufCont::close)
         .map(mapper)
+        .takeWhile(MapTsItemVec::notTerm)
         .doFinally(k -> mapper.release())
         .transform(doDiscard("EventBlobToV1MapTsTrans"))
         .doOnNext(obj -> obj.markWith(BufCont.Mark.MapTs_trans2));
@@ -107,31 +124,36 @@ public class EventBlobToV1MapTs implements Function<BufCont, MapTsItemVec> {
     @Override
     public synchronized MapTsItemVec apply(BufCont bufcont) {
         if (bufcont.isEmpty()) {
+            LOGGER.info(markBufTrace, "{}  {}  apply  EMPTY", reqCtx, name);
             applyBufContEmpty.getAndAdd(1);
             bufcont.close();
-            return MapTsItemVec.empty();
-        }
-        final DataBuffer buf = bufcont.bufferRef();
-        if (state == State.TERM) {
-            applyDespiteTerm.getAndAdd(1);
-            bufcont.close();
-            return MapTsItemVec.term();
+            return MapTsItemVec.create();
         }
         else {
-            if (buf.readableByteCount() == 0) {
-                applyEmptyBuffer.getAndAdd(1);
+            final DataBuffer buf = bufcont.bufferRef();
+            LOGGER.info(markBufTrace, "{}  {}  apply  rp {}  wp {}", reqCtx, name, buf.readPosition(), buf.writePosition());
+            if (state == State.TERM) {
+                applyDespiteTerm.getAndAdd(1);
+                bufcont.close();
+                return MapTsItemVec.term();
             }
-            inpCount.getAndAdd(1);
-            inpBytes.getAndAdd(buf.readableByteCount());
-            MapTsItemVec ret = applyInner(bufcont);
-            ret.markWith(BufCont.Mark.MapTs_apply);
-            return ret;
+            else {
+                if (buf.readableByteCount() == 0) {
+                    applyEmptyBuffer.getAndAdd(1);
+                }
+                inpCount.getAndAdd(1);
+                inpBytes.getAndAdd(buf.readableByteCount());
+                MapTsItemVec ret = applyInner(bufcont);
+                ret.markWith(BufCont.Mark.MapTs_apply);
+                return ret;
+            }
         }
     }
 
     MapTsItemVec applyInner(BufCont bufcont) {
-        MapTsItemVec ret = MapTsItemVec.empty();
+        MapTsItemVec ret = MapTsItemVec.create();
         DataBuffer buf = bufcont.bufferRef();
+        LOGGER.info(markBufTrace, "{}  {}  applyInner  rp {}  wp {}", reqCtx, name, buf.readPosition(), buf.writePosition());
         if (leftbufcont != null && !leftbufcont.hasBuf()) {
             leftWithoutBuf.getAndAdd(1);
             leftbufcont.close();
@@ -149,10 +171,12 @@ public class EventBlobToV1MapTs implements Function<BufCont, MapTsItemVec> {
         int bufEnd = buf.readPosition();
         if (inside == 1) {
             if (markBeg >= 0) {
-                ret.add(markBeg, bufEnd - markBeg, ts, MapTsItemVec.Ty.OPEN);
+                LOGGER.info(markBufTrace, "{}  OPEN    case A  {}", name, ts);
+                ret.add(markBeg, bufEnd - markBeg, ts, pulse, MapTsItemVec.Ty.OPEN);
             }
             else {
-                ret.add(bufBeg, bufEnd - bufBeg, ts, MapTsItemVec.Ty.MIDDLE);
+                LOGGER.info(markBufTrace, "{}  MIDDLE  case A  {}", name, ts);
+                ret.add(bufBeg, bufEnd - bufBeg, ts, pulse, MapTsItemVec.Ty.MIDDLE);
             }
         }
         if (state != State.TERM && buf.readableByteCount() > 0) {
@@ -162,17 +186,19 @@ public class EventBlobToV1MapTs implements Function<BufCont, MapTsItemVec> {
             if (buf.readableByteCount() >= needMin) {
                 throw new RuntimeException("logic");
             }
+            LOGGER.info(markBufTrace, "{}  {}  keep bytes left: {}", reqCtx, name, buf.readableByteCount());
             leftbufcont = BufCont.allocate(buf.factory(), 1024, BufCont.Mark.MapTs_keep_left);
             DataBuffer left = leftbufcont.bufferRef();
             left.write(buf);
         }
         buf.readPosition(bufBeg);
         buf.writePosition(bufEnd);
-        bufcont.close();
+        LOGGER.info(markBufTrace, "{}  {}  ret stats {}", reqCtx, name, ret.stats());
         return ret;
     }
 
     void applyLeft(DataBuffer buf, MapTsItemVec ret) {
+        LOGGER.info(markBufTrace, "{}  {}  applyLeft  rp {}  wp {}", reqCtx, name, buf.readPosition(), buf.writePosition());
         DataBuffer left = leftbufcont.bufferRef();
         if (needMin <= 0) {
             throw new RuntimeException("logic");
@@ -207,24 +233,26 @@ public class EventBlobToV1MapTs implements Function<BufCont, MapTsItemVec> {
             if (left.readableByteCount() != 0) {
                 throw new RuntimeException("logic");
             }
+            int bufEnd = left.readPosition();
             if (inside == 1) {
                 if (markBeg >= 0) {
-                    ret.add(markBeg, left.readPosition() - markBeg, ts, MapTsItemVec.Ty.OPEN);
+                    LOGGER.info(markBufTrace, "{}  OPEN    case B  {}", name, ts);
+                    ret.add(markBeg, bufEnd - markBeg, ts, pulse, MapTsItemVec.Ty.OPEN);
                 }
                 else {
-                    ret.add(bufBeg, left.readPosition() - bufBeg, ts, MapTsItemVec.Ty.MIDDLE);
+                    LOGGER.info(markBufTrace, "{}  MIDDLE  case A  {}", name, ts);
+                    ret.add(bufBeg, bufEnd - bufBeg, ts, pulse, MapTsItemVec.Ty.MIDDLE);
                 }
             }
-            left.writePosition(left.readPosition());
             left.readPosition(bufBeg);
-            leftbufcont.close();
+            left.writePosition(bufEnd);
             leftbufcont = null;
         }
     }
 
     void parse(DataBuffer buf, MapTsItemVec res) {
         if (state == State.EXPECT_HEADER_A) {
-            parseHeaderA(buf, res);
+            parseHeaderA(buf);
         }
         else if (state == State.EXPECT_BLOBS) {
             parseBlob(buf);
@@ -239,18 +267,18 @@ public class EventBlobToV1MapTs implements Function<BufCont, MapTsItemVec> {
         }
     }
 
-    void parseHeaderA(DataBuffer buf, MapTsItemVec res) {
+    void parseHeaderA(DataBuffer buf) {
         int bpos = buf.readPosition();
         ByteBuffer bb = buf.asByteBuffer(buf.readPosition(), needMin);
         buf.readPosition(buf.readPosition() + needMin);
         int length = bb.getInt();
         if (length == 0) {
-            LOGGER.warn("{}  {}  Stop because length == 0", reqctx, name);
+            LOGGER.warn("{}  {}  Stop because length == 0", reqCtx, name);
             state = State.TERM;
             return;
         }
         if (length < 40 || length > 60 * 1024 * 1024) {
-            LOGGER.error("{}  {}  Stop because unexpected  length {}", reqctx, name, length);
+            LOGGER.error("{}  {}  Stop because unexpected  length {}", reqCtx, name, length);
             state = State.TERM;
             return;
         }
@@ -260,13 +288,18 @@ public class EventBlobToV1MapTs implements Function<BufCont, MapTsItemVec> {
         long iocTime = bb.getLong();
         byte status = bb.get();
         byte severity = bb.get();
-        LOGGER.debug("{}  {}  seen  length  {}  timestamp {} {}  pulse {}", reqctx, name, length, ts / 1000000000L, ts % 1000000000, pulse);
+        LOGGER.info(markBufTrace, "{}  {}  headerA  pos {}  length  {}  timestamp {} {}  pulse {}", reqCtx, name, bpos, length, ts / 1000000000L, ts % 1000000000, pulse);
         if (ts >= endNanos) {
-            LOGGER.info("{}  {}  ts >= endNanos  {} {}  >=  {} {}", reqctx, name, ts / 1000000000L, ts % 1000000000, endNanos / 1000000000L, endNanos % 1000000000);
-            state = State.TERM;
-            buf.readPosition(bpos);
-            buf.writePosition(bpos);
-            return;
+            if (trailingEvents >= trailingEventsMax) {
+                LOGGER.debug("{}  {}  ts >= endNanos  {} {}  >=  {} {}", reqCtx, name, ts / 1000000000L, ts % 1000000000, endNanos / 1000000000L, endNanos % 1000000000);
+                state = State.TERM;
+                buf.readPosition(bpos);
+                buf.writePosition(bpos);
+                return;
+            }
+            else {
+                trailingEvents += 1;
+            }
         }
         if (tsLast != Long.MIN_VALUE && ts < tsLast) {
             if (!detectedUnordered) {
@@ -279,23 +312,26 @@ public class EventBlobToV1MapTs implements Function<BufCont, MapTsItemVec> {
                 LOGGER.error("unordered pulse  {}  {}  in {}", pulse, pulseLast, name);
             }
         }
+        if (countGaps && pulseLast != Long.MIN_VALUE && pulseLast + 1 != pulse) {
+            pulseGapCount.getAndAdd(1);
+        }
         tsLast = ts;
         pulseLast = pulse;
         int optionalFieldsLength = bb.getInt();
         if (optionalFieldsLength < -1 || optionalFieldsLength == 0) {
-            LOGGER.error("{}  {}  unexpected value for optionalFieldsLength: {}", reqctx, name, optionalFieldsLength);
+            LOGGER.error("{}  {}  unexpected value for optionalFieldsLength: {}", reqCtx, name, optionalFieldsLength);
             throw new RuntimeException("unexpected optional fields");
         }
         if (optionalFieldsLength != -1) {
-            LOGGER.warn("{}  {}  Found optional fields: {}", reqctx, name, optionalFieldsLength);
+            LOGGER.warn("{}  {}  Found optional fields: {}", reqCtx, name, optionalFieldsLength);
         }
         if (optionalFieldsLength > 2048) {
-            LOGGER.error("{}  {}  unexpected optional fields: {}", reqctx, name, optionalFieldsLength);
+            LOGGER.error("{}  {}  unexpected optional fields: {}", reqCtx, name, optionalFieldsLength);
             throw new RuntimeException("unexpected optional fields");
         }
         headerLength = needMin;
-        this.pulse = pulse;
         this.ts = ts;
+        this.pulse = pulse;
         this.optionalFieldsLength = Math.max(optionalFieldsLength, 0);
         this.blobLength = length;
         state = State.EXPECT_BLOBS;
@@ -324,20 +360,22 @@ public class EventBlobToV1MapTs implements Function<BufCont, MapTsItemVec> {
         buf.readPosition(buf.readPosition() + needMin);
         int len2 = bb.getInt();
         if (len2 == -1) {
-            LOGGER.warn("{}  {}  2nd length -1 encountered, ignoring", reqctx, name);
+            LOGGER.warn("{}  {}  2nd length -1 encountered, ignoring", reqCtx, name);
         }
         else if (len2 == 0) {
-            LOGGER.warn("{}  {}  2nd length 0 encountered, ignoring", reqctx, name);
+            LOGGER.warn("{}  {}  2nd length 0 encountered, ignoring", reqCtx, name);
         }
         else if (len2 != blobLength) {
-            LOGGER.error("{}  {}  event blob length mismatch at {}   {} vs {}", reqctx, name, buf.readPosition(), len2, blobLength);
+            LOGGER.error("{}  {}  event blob length mismatch at {}   {} vs {}", reqCtx, name, buf.readPosition(), len2, blobLength);
             throw new RuntimeException("unexpected 2nd length");
         }
         if (markBeg >= 0) {
-            res.add(markBeg, buf.readPosition() - markBeg, ts, MapTsItemVec.Ty.FULL);
+            LOGGER.info(markBufTrace, "{}  FULL    case -  {}", name, ts);
+            res.add(markBeg, buf.readPosition() - markBeg, ts, pulse, MapTsItemVec.Ty.FULL);
         }
         else {
-            res.add(bufBeg, buf.readPosition() - bufBeg, ts, MapTsItemVec.Ty.CLOSE);
+            LOGGER.info(markBufTrace, "{}  CLOSE   case -  {}", name, ts);
+            res.add(bufBeg, buf.readPosition() - bufBeg, ts, pulse, MapTsItemVec.Ty.CLOSE);
         }
         state = State.EXPECT_HEADER_A;
         needMin = HEADER_A_LEN;
@@ -351,7 +389,7 @@ public class EventBlobToV1MapTs implements Function<BufCont, MapTsItemVec> {
         else {
             closeCount.getAndAdd(1);
         }
-        LOGGER.debug("{}  {}  EventBlobToV1MapTs release", reqctx, name);
+        LOGGER.debug("{}  {}  EventBlobToV1MapTs release", reqCtx, name);
         if (leftbufcont != null) {
             BufCont k = leftbufcont;
             leftbufcont = null;

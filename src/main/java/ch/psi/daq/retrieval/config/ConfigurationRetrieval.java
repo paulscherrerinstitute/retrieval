@@ -24,6 +24,7 @@ public class ConfigurationRetrieval {
     public String canonicalHostname;
     public String databufferBaseDir;
     public String databufferKeyspacePrefix;
+    public boolean testPulseMap;
 
     @Override
     public String toString() {

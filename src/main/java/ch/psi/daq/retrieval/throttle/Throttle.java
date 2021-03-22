@@ -1,5 +1,6 @@
 package ch.psi.daq.retrieval.throttle;
 
+import ch.psi.daq.retrieval.bytes.BufCont;
 import org.springframework.core.io.buffer.DataBuffer;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -11,6 +12,16 @@ import java.util.Arrays;
 public class Throttle {
 
     public static Flux<DataBuffer> throttle(Flux<DataBuffer> fl, long rate, int steps, int interval, int overslack) {
+        if (rate > 0) {
+            Throttle throttle = new Throttle(rate, steps, interval, overslack);
+            return fl.concatMap(throttle::map, 0);
+        }
+        else {
+            return fl;
+        }
+    }
+
+    public static Flux<BufCont> throttleBufCont(Flux<BufCont> fl, long rate, int steps, int interval, int overslack) {
         if (rate > 0) {
             Throttle throttle = new Throttle(rate, steps, interval, overslack);
             return fl.concatMap(throttle::map, 0);
@@ -39,6 +50,10 @@ public class Throttle {
     }
 
     Mono<DataBuffer> map(DataBuffer buf) {
+        return map2(buf, buf.readableByteCount());
+    }
+
+    Mono<BufCont> map(BufCont buf) {
         return map2(buf, buf.readableByteCount());
     }
 

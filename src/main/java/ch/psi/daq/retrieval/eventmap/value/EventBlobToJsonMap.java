@@ -1,7 +1,9 @@
 package ch.psi.daq.retrieval.eventmap.value;
 
 import ch.psi.bitshuffle.BitShuffleLZ4JNIDecompressor;
-import ch.psi.daq.retrieval.DTypeBitmapUtils;
+import ch.psi.daq.retrieval.reqctx.BufCtx;
+import ch.psi.daq.retrieval.utils.DTypeBitmapUtils;
+import ch.psi.daq.retrieval.config.ChannelConfigEntry;
 import ch.psi.daq.retrieval.eventmap.EventDataType;
 import ch.psi.daq.retrieval.bytes.BufCont;
 import com.fasterxml.jackson.annotation.JsonInclude;
@@ -11,7 +13,6 @@ import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import ch.qos.logback.classic.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.io.buffer.DataBuffer;
-import org.springframework.core.io.buffer.DataBufferFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -25,15 +26,14 @@ import java.util.stream.Collectors;
 import static ch.psi.daq.retrieval.eventmap.EventDataType.*;
 
 public class EventBlobToJsonMap implements Function<BufCont, MapJsonResult> {
-    static Logger LOGGER = (Logger) LoggerFactory.getLogger("EventBlobToJsonMap");
+    static Logger LOGGER = (Logger) LoggerFactory.getLogger(EventBlobToJsonMap.class.getSimpleName());
     static final int HEADER_A_LEN = 2 * Integer.BYTES + 4 * Long.BYTES + 2 * Byte.BYTES;
-    DataBufferFactory bufFac;
-    BufCont kbufcont = BufCont.makeEmpty(BufCont.Mark.JsMap_init);
-    BufCont leftbufcont = BufCont.makeEmpty(BufCont.Mark.JsMap_init);
+    ChannelConfigEntry configEntry;
+    BufCtx bufCtx;
+    BufCont leftbufcont;
+    BufCont kbufcont;
     boolean headerOut;
     boolean blobHeaderOut;
-    int bufferSize;
-    int bufferSize2;
     String channelName;
     State state;
     int needMin;
@@ -81,27 +81,29 @@ public class EventBlobToJsonMap implements Function<BufCont, MapJsonResult> {
         public List<Integer> shape;
     }
 
-    public EventBlobToJsonMap(String channelName, long endNanos, DataBufferFactory bufFac, int bufferSize, long limitBytes) {
+    public EventBlobToJsonMap(String channelName, ChannelConfigEntry configEntry, long endNanos, BufCtx bufCtx, long limitBytes) {
         this.channelName = channelName;
-        this.bufFac = bufFac;
-        this.bufferSize = bufferSize;
-        this.bufferSize2 = 2 * bufferSize;
+        this.configEntry = configEntry;
+        this.bufCtx = bufCtx;
         this.endNanos = endNanos;
         this.state = State.EXPECT_HEADER_A;
         this.needMin = HEADER_A_LEN;
         this.limitBytes = limitBytes;
     }
 
-    public static Flux<MapJsonResult> trans2(Flux<BufCont> fl, String channelName, long endNanos, DataBufferFactory bufFac, int bufferSize, long limitBytes) {
-        EventBlobToJsonMap mapper = new EventBlobToJsonMap(channelName, endNanos, bufFac, bufferSize, limitBytes);
+    public static Flux<MapJsonResult> trans(Flux<BufCont> fl, String channelName, ChannelConfigEntry configEntry, long endNanos, BufCtx bufCtx, long limitBytes) {
+        EventBlobToJsonMap mapper = new EventBlobToJsonMap(channelName, configEntry, endNanos, bufCtx, limitBytes);
         return fl.map(mapper)
         .concatWith(Mono.defer(() -> Mono.just(mapper.lastResult())))
-        .doOnNext(item -> {
-            if (item.isTerm()) {
-                LOGGER.warn("reached TERM");
+        .takeWhile(item -> {
+            if (item.notTerm()) {
+                return true;
+            }
+            else {
+                item.release();
+                return false;
             }
         })
-        .takeWhile(item -> !item.isTerm())
         .doOnDiscard(MapJsonResult.class, MapJsonResult::release)
         .doFinally(k -> mapper.release());
     }
@@ -230,15 +232,7 @@ public class EventBlobToJsonMap implements Function<BufCont, MapJsonResult> {
         byte status = bb.get();
         byte severity = bb.get();
         seenHeaderA += 1;
-        LOGGER.trace("seen  length {}  timestamp {}  pulse {}  seenHeaderA {}", length, ts, pulse, seenHeaderA);
-        if (ts < 1200100100100100100L || ts > 1700100100100100100L) {
-            LOGGER.error("unexpected ts {}", ts);
-            throw new RuntimeException("error");
-        }
-        if (pulse < 0 || pulse > 20100100100L) {
-            LOGGER.debug("unexpected pulse {}", pulse);
-            //throw new RuntimeException("error");
-        }
+        //LOGGER.trace("seen  length {}  timestamp {}  pulse {}  seenHeaderA {}", length, ts, pulse, seenHeaderA);
         if (ts >= endNanos) {
             LOGGER.info("stop  ts {}  >=  end {}", ts, endNanos);
             state = State.TERM;
@@ -261,10 +255,6 @@ public class EventBlobToJsonMap implements Function<BufCont, MapJsonResult> {
         this.ts = ts;
         this.optionalFieldsLength = Math.max(optionalFieldsLength, 0);
         this.blobLength = length;
-        if (blobLength < 1 || blobLength > 20 * 1024 * 1024) {
-            LOGGER.error("Unexpected blobLength {}", blobLength);
-            throw new RuntimeException("Unexpected blobLength");
-        }
         state = State.EXPECT_HEADER_B;
         needMin = this.optionalFieldsLength + Short.BYTES;
     }
@@ -493,7 +483,7 @@ public class EventBlobToJsonMap implements Function<BufCont, MapJsonResult> {
             if (edt.isInt()) {
                 if (edt.isSignedInt()) {
                     if (blobsArray == 1) {
-                        // TODO should the json value already be shaped? matter only for 1d, images are usually not fetched as json
+                        // TODO should the unpack value already be shaped? matter only for 1d, images are usually not fetched as unpack
                         ArrayNode node = JsonNodeFactory.instance.arrayNode(nf);
                         while (dst.remaining() > 0) {
                             if (tsize == 1) {
@@ -525,7 +515,7 @@ public class EventBlobToJsonMap implements Function<BufCont, MapJsonResult> {
                 }
                 else if (edt.isUnsignedInt()) {
                     if (blobsArray == 1) {
-                        // TODO should the json value already be shaped? matter only for 1d, images are usually not fetched as json
+                        // TODO should the unpack value already be shaped? matter only for 1d, images are usually not fetched as unpack
                         ArrayNode node = new ArrayNode(JsonNodeFactory.instance);
                         while (dst.remaining() > 0) {
                             if (tsize == 1) {
@@ -543,7 +533,7 @@ public class EventBlobToJsonMap implements Function<BufCont, MapJsonResult> {
                             else if (tsize == 8) {
                                 long v = dst.getLong();
                                 if (v < 0) {
-                                    throw new RuntimeException("Java has no unsigned 64 bit integer");
+                                    throw new RuntimeException("Java has no unsigned 64 bit scalarnum");
                                 }
                                 node.add(v);
                             }

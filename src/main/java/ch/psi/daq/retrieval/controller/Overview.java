@@ -1,18 +1,22 @@
 package ch.psi.daq.retrieval.controller;
 
-import ch.psi.daq.retrieval.ChannelEventStream;
+import ch.psi.daq.retrieval.finder.BaseDirFinderFormatV0;
+import ch.psi.daq.retrieval.merger.MergerSupport;
+import ch.psi.daq.retrieval.utils.ChannelEventStream;
 import ch.psi.daq.retrieval.bytes.BufCont;
 import ch.psi.daq.retrieval.eventmap.ts.EventBlobToV1MapTs;
 import ch.psi.daq.retrieval.eventmap.ts.MapTsItemVec;
 import ch.psi.daq.retrieval.eventmap.value.EventBlobToV1Map;
 import ch.psi.daq.retrieval.merger.Merger;
 import ch.psi.daq.retrieval.status.RequestStatusBoard;
+import ch.psi.daq.retrieval.subnodes.RawClient;
+import ch.psi.daq.retrieval.subnodes.RawSub;
+import ch.psi.daq.retrieval.utils.PubRepeat;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.JsonNode;
 
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.List;
 
 public class Overview {
     public ZonedDateTime ts;
@@ -29,6 +33,7 @@ public class Overview {
     public long totalDataRequests;
     public JsonNode info;
     public String showTest;
+    public String runtimeVersion = Runtime.version().toString();
     @JsonProperty
     public BufCont.Stats getBufContStats() {
         return new BufCont.Stats();
@@ -64,6 +69,18 @@ public class Overview {
     @JsonProperty
     public RawClient.Stats getRawClientStats() {
         return new RawClient.Stats();
+    }
+    @JsonProperty
+    public PubRepeat.Stats getPubRepeatStats() {
+        return new PubRepeat.Stats();
+    }
+    @JsonProperty
+    public MergerSupport.Stats getMergerSupportStats() {
+        return new MergerSupport.Stats();
+    }
+    @JsonProperty
+    public BaseDirFinderFormatV0.Stats getBaseDirFinderFormatV0Stats() {
+        return new BaseDirFinderFormatV0.Stats();
     }
     @JsonProperty
     String getDetectionLevel() { return System.getProperty("io.netty.leakDetection.level"); }

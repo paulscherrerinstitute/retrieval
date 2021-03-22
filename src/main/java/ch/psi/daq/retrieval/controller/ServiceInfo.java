@@ -1,9 +1,8 @@
 package ch.psi.daq.retrieval.controller;
 
-import ch.psi.daq.retrieval.ReqCtx;
+import ch.psi.daq.retrieval.reqctx.ReqCtx;
 import ch.psi.daq.retrieval.bytes.BufCont;
 import ch.qos.logback.classic.Logger;
-import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.io.DefaultResourceLoader;
@@ -123,10 +122,10 @@ public class ServiceInfo {
         BufCont.allocate(exchange.getResponse().bufferFactory(), 1234, BufCont.Mark.TestA);
     }
 
-    static class Datafile {
-        FileTime mtime;
-        long flen;
-        Datafile(FileTime mtime, long flen) {
+    public static class Datafile {
+        public FileTime mtime;
+        public long flen;
+        public Datafile(FileTime mtime, long flen) {
             this.mtime = mtime;
             this.flen = flen;
         }
@@ -135,13 +134,13 @@ public class ServiceInfo {
         }
     }
 
-    static class Split {
-        int sp;
-        List<Datafile> datafiles = new ArrayList<>();
-        Split(int sp) {
+    public static class Split {
+        public int sp;
+        public List<Datafile> datafiles = new ArrayList<>();
+        public Split(int sp) {
             this.sp = sp;
         }
-        long fileCount() {
+        public long fileCount() {
             return datafiles.size();
         }
     }
@@ -167,13 +166,13 @@ public class ServiceInfo {
         return ret;
     }
 
-    static class Timebin {
-        int tb;
-        List<Split> splits = new ArrayList<>();
-        Timebin(int tb) {
+    public static class Timebin {
+        public int tb;
+        public List<Split> splits = new ArrayList<>();
+        public Timebin(int tb) {
             this.tb = tb;
         }
-        long fileCount() {
+        public long fileCount() {
             return splits.stream().map(Split::fileCount).reduce(0L, Long::sum);
         }
     }
@@ -197,20 +196,20 @@ public class ServiceInfo {
         return ret;
     }
 
-    static class Channel {
-        String name;
-        int ks;
-        List<Timebin> timebins = new ArrayList<>();
-        Channel(String name, int ks) {
+    public static class Channel {
+        public String name;
+        public int ks;
+        public List<Timebin> timebins = new ArrayList<>();
+        public Channel(String name, int ks) {
             this.name = name;
             this.ks = ks;
         }
-        long fileCount() {
+        public long fileCount() {
             return timebins.stream().map(Timebin::fileCount).reduce(0L, Long::sum);
         }
     }
 
-    static Channel scanChannel(DataRepo dr, Path baseKsData, int ks, String channel, SearchParams searchParams) throws IOException {
+    public static Channel scanChannel(DataRepo dr, Path baseKsData, int ks, String channel, SearchParams searchParams) throws IOException {
         Channel ret = new Channel(channel, ks);
         Path dir = baseKsData.resolve(channel);
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
@@ -256,9 +255,9 @@ public class ServiceInfo {
         return ret;
     }
 
-    static class DataRepo {
-        List<Keyspace> keyspaces = new ArrayList<>();
-        long fileCount() {
+    public static class DataRepo {
+        public List<Keyspace> keyspaces = new ArrayList<>();
+        public long fileCount() {
             return keyspaces.stream().map(Keyspace::fileCount).reduce(0L, Long::sum);
         }
     }
@@ -296,18 +295,18 @@ public class ServiceInfo {
         }
     }
 
-    static class SearchParams {
-        long minFileLen;
-        Instant minMtime;
-        Duration maxSec;
-        int maxFiles;
-        int foundFiles;
-        Instant tsBeg;
-        int ks;
-        SearchParams() {
+    public static class SearchParams {
+        public long minFileLen;
+        public Instant minMtime;
+        public Duration maxSec;
+        public int maxFiles;
+        public int foundFiles;
+        public Instant tsBeg;
+        public int ks;
+        public SearchParams() {
             tsBeg = Instant.now();
         }
-        boolean stop() {
+        public boolean stop() {
             return foundFiles >= maxFiles || tsBeg.isBefore(Instant.now().minus(maxSec));
         }
     }
@@ -367,7 +366,7 @@ public class ServiceInfo {
 
     @GetMapping(path = "/logtest")
     public String version(ServerWebExchange exchange) {
-        ReqCtx reqctx = ReqCtx.fromRequest(exchange);
+        ReqCtx reqctx = ReqCtx.fromRequest(exchange, api101.rsb);
         LOGGER.info("plain info");
         LOGGER.debug("plain debug");
         LOGGER.trace("plain trace");

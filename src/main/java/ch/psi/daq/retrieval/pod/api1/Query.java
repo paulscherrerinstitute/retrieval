@@ -3,19 +3,20 @@ package ch.psi.daq.retrieval.pod.api1;
 import ch.qos.logback.classic.Level;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
-import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonSetter;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 
 import java.util.List;
 
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(value = JsonInclude.Include.NON_DEFAULT)
 public class Query {
-    public List<String> channels;
+    public ChannelList channels;
     public Range range;
     public Aggregation aggregation;
     // The following are for testing usage only:
     public List<Integer> splits;
+    public String mainReqId;
     public int bufferSize;
     public int decompressOnServer;
     public long limitEventsPerChannel;
@@ -35,6 +36,13 @@ public class Query {
     public int subTokenRate;
     public int flattenSlicesPrefetch;
     public int mergerSupportItemVecPrefetch;
+    public int rawItemVecPrefetch;
+    public int subwgroup;
+    public int waitForData;
+    public int trailingEventsMax;
+    public int limitRawRead;
+    public int bufferSizeDiskRead;
+
     @JsonSetter
     public void setLoglevel(String name) {
         if (name.equals("trace")) {

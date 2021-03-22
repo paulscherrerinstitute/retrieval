@@ -1,24 +1,23 @@
 package ch.psi.daq.retrieval.eventmap.ts;
 
 import ch.psi.daq.retrieval.bytes.BufCont;
+import ch.psi.daq.retrieval.merger.MergeToken;
 import ch.psi.daq.retrieval.merger.Releasable;
 import ch.psi.daq.retrieval.merger.Markable;
+import ch.qos.logback.classic.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.lang.NonNull;
 
-public class MapTsToken implements Comparable<MapTsToken>, Markable, Releasable {
-    public BufCont bufcont;
-    public int fid;
-    public int pos;
-    public int len;
-    public long ts;
-    public MapTsItemVec.Ty ty;
+public class MapTsToken implements Comparable<MapTsToken>, Markable, Releasable, MergeToken {
+    static final Logger LOGGER = (Logger) LoggerFactory.getLogger(MapTsToken.class.getSimpleName());
 
-    public MapTsToken(BufCont bufcont, int fid, int pos, int len, long ts, MapTsItemVec.Ty ty) {
+    public MapTsToken(BufCont bufcont, int fid, int pos, int len, long ts, long pulse, MapTsItemVec.Ty ty) {
         this.bufcont = bufcont;
         this.fid = fid;
         this.pos = pos;
         this.len = len;
         this.ts = ts;
+        this.pulse = pulse;
         this.ty = ty;
     }
 
@@ -46,7 +45,13 @@ public class MapTsToken implements Comparable<MapTsToken>, Markable, Releasable 
     public synchronized void release() {
         BufCont k = bufcont;
         bufcont = null;
-        k.close();
+        if (k != null) {
+            k.close();
+        }
+        else if (!released) {
+            LOGGER.warn("not released, bufcont null");
+        }
+        released = true;
     }
 
     @Override
@@ -54,7 +59,7 @@ public class MapTsToken implements Comparable<MapTsToken>, Markable, Releasable 
         release();
     }
 
-    public void appendName(BufCont.Mark mark) {
+    public void appendMark(BufCont.Mark mark) {
         if (BufCont.doMark) {
             if (bufcont != null) {
                 bufcont.appendMark(mark);
@@ -64,7 +69,31 @@ public class MapTsToken implements Comparable<MapTsToken>, Markable, Releasable 
 
     @Override
     public void markWith(BufCont.Mark mark) {
-        appendName(mark);
+        appendMark(mark);
     }
+
+    @Override
+    public MapTsItemVec.Ty ty() {
+        return ty;
+    }
+
+    @Override
+    public long ts() {
+        return ts;
+    }
+
+    @Override
+    public long pulse() {
+        return pulse;
+    }
+
+    public BufCont bufcont;
+    public int fid;
+    public int pos;
+    public int len;
+    public long ts;
+    public long pulse;
+    public MapTsItemVec.Ty ty;
+    boolean released;
 
 }

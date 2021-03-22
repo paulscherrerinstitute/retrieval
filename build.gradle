@@ -1,80 +1,39 @@
-buildscript {
-    repositories {
-        mavenCentral()
-        //jcenter()
-    }
-    dependencies {
-        classpath 'com.jfrog.bintray.gradle:gradle-bintray-plugin:1.8.2'
-    }
-}
-
 plugins {
+    id 'application'
     id 'org.springframework.boot' version '2.4.1'
-    id 'maven-publish'
-    id 'java-library'
-    //id 'jacoco'
 }
-
-def springBootVersion = '2.4.1'
-
-apply plugin: 'java'
-apply plugin: 'io.spring.dependency-management'
-apply plugin: 'org.springframework.boot'
-apply plugin: 'com.jfrog.bintray'
-
-/*
-jacoco {
-    toolVersion = "0.8.5"
-}
-*/
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_11
-    targetCompatibility = JavaVersion.VERSION_11
+    sourceCompatibility = JavaVersion.VERSION_12
+    targetCompatibility = JavaVersion.VERSION_12
 }
 
 group 'ch.psi.daq'
-version '2.0.0'
-
-bintray {
-    user = System.getenv('BINTRAY_USER')
-    key = System.getenv('BINTRAY_KEY')
-    pkg {
-        userOrg = 'paulscherrerinstitute'
-        repo = 'hltools'
-        //userOrg = 'psidaq'
-        //repo = 'daqbuffer_mvn'
-        name = 'retrieval'
-        vcsUrl = 'https://github.com/paulscherrerinstitute/retrieval'
-        licenses = ['GPL-3.0']
-        version {
-            name = project.version
-        }
-        publish = false
-    }
-    publications = ['bootJarFile']
-}
+version '2.1.0'
 
 repositories {
     mavenCentral()
-    //jcenter()
     maven { url "https://dl.bintray.com/paulscherrerinstitute/hltools" }
 }
 
 dependencies {
     implementation group: 'ch.qos.logback', name: 'logback-classic', version: '1.2.3'
-    implementation group: 'org.springframework.boot', name: 'spring-boot-starter-webflux', version: springBootVersion
-    implementation group: 'org.springframework.boot', name: 'spring-boot-starter-reactor-netty', version: springBootVersion
-    implementation group: 'org.springframework.boot', name: 'spring-boot-configuration-processor', version: springBootVersion
-    testImplementation group: 'org.springframework.boot', name: 'spring-boot-starter-test', version: springBootVersion
+    implementation platform(org.springframework.boot.gradle.plugin.SpringBootPlugin.BOM_COORDINATES)
+    implementation group: 'org.springframework.boot', name: 'spring-boot-starter-webflux'
+    implementation group: 'org.springframework.boot', name: 'spring-boot-starter-reactor-netty'
+    //implementation group: 'org.springframework.boot', name: 'spring-boot-configuration-processor'
+    implementation group: 'io.projectreactor', name: 'reactor-tools', version: '3.4.1'
+    testImplementation group: 'org.springframework.boot', name: 'spring-boot-starter-test'
+    testImplementation group: 'org.junit.jupiter', name: 'junit-jupiter'
     implementation group: 'com.google.guava', name: 'guava', version: '30.1-jre'
     implementation group: 'ch.psi', name: 'bsread', version: '3.5.14'
     implementation group: 'ch.psi', name: 'bitshuffle-lz4', version: '1.1.2'
-    implementation group: 'org.junit.jupiter', name: 'junit-jupiter', version: '5.7.0'
     implementation group: 'org.postgresql', name: 'postgresql', version: '42.2.18.jre7'
-    testImplementation group: 'junit', name: 'junit', version: '4.13.1'
     implementation(files('../ch.psi.daq.retrievalutils/build/libs/ch.psi.daq.retrievalutils-0.0.1.jar'))
-    implementation group: 'io.projectreactor', name: 'reactor-tools', version: '3.4.1'
+}
+
+test {
+    useJUnitPlatform()
 }
 
 processResources {
@@ -87,24 +46,9 @@ processResources {
     expand(appVersion: project.version, buildDateTime: ZonedDateTime.now(ZoneOffset.UTC).format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssz")), commitDescribe: commitDescribe)
 }
 
-jar { enabled = true }
-bootJar { archiveClassifier.set('all') }
-
-/*
-jacocoTestReport {
-    reports {
-        xml.enabled (project.properties["covxml"] ? true : false)
-        html.enabled (project.properties["covxml"] ? false : true)
-    }
-}
-*/
-
-publishing {
-    publications {
-        bootJarFile(MavenPublication) {
-            artifact bootJar
-        }
-    }
+//jar { enabled = true }
+bootJar {
+    archiveClassifier.set('all')
 }
 
 import java.nio.ByteBuffer
@@ -115,12 +59,17 @@ import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 
 task bootJarVer {
-    dependsOn bootJar
     doLast {
-        OutputStream f1 = Files.newOutputStream(java.nio.file.Path.of("build/lib/thisver.txt"));
-        String ver = project.version.toString();
-        ByteBuffer buf = StandardCharsets.UTF_8.encode(ver);
+        String ver = project.version.toString()
+        System.out.format("Built version %s\n", ver)
+        ByteBuffer buf = StandardCharsets.UTF_8.encode(ver)
+        Files.createDirectories(java.nio.file.Path.of("build/libs"))
+        OutputStream f1 = Files.newOutputStream(java.nio.file.Path.of("build/libs/thisver.txt"))
         f1.write(buf.array(), buf.position(), buf.remaining())
-        f1.close();
+        f1.close()
     }
+}
+
+bootJar {
+    dependsOn bootJarVer
 }

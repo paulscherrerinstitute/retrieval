@@ -2,6 +2,8 @@ package ch.psi.daq.retrieval.eventmap.ts;
 
 import ch.psi.daq.retrieval.bytes.BufCont;
 import ch.psi.daq.retrieval.merger.Releasable;
+import ch.qos.logback.classic.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.core.io.buffer.DataBuffer;
 import reactor.core.publisher.Flux;
 
@@ -10,41 +12,51 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class MapTsItemVec implements Releasable {
-    ItemsBuffer item1;
-    ItemsBuffer item2;
-    boolean term;
-    int bufCount;
+    static final Logger LOGGER = (Logger) LoggerFactory.getLogger(MapTsItemVec.class.getSimpleName());
 
-    static class ItemsBuffer {
-        BufCont bufcont;
-        List<Integer> posL = new ArrayList<>();
-        List<Long> tsL = new ArrayList<>();
-        List<Ty> tyL = new ArrayList<>();
-        List<Integer> lenL = new ArrayList<>();
+    // allow access only for checking
+    public static class ItemsBuffer {
         ItemsBuffer(BufCont bufcont) {
-            this.bufcont = bufcont.cloned(BufCont.Mark.ITEM_VEC_IB_CTOR);
+            bufcont.appendMark(BufCont.Mark.ITEM_VEC_IB_CTOR);
+            this.bufcont = bufcont;
         }
-        void add(int pos, int len, long ts, Ty ty) {
+        void add(int pos, int len, long ts, long pulse, Ty ty) {
+            //LOGGER.info("ItemsBuffer   add   pos {}  len {}  ts {}  ty {}", pos, len, ts, ty.toString());
             posL.add(pos);
             lenL.add(len);
             tsL.add(ts);
+            pulseL.add(pulse);
             tyL.add(ty);
         }
         synchronized void release() {
             if (bufcont != null) {
-                BufCont k = bufcont;
+                BufCont bc = bufcont;
                 bufcont = null;
-                k.close();
+                bc.close();
             }
+            posL.clear();
+            tsL.clear();
+            pulseL.clear();
+            tyL.clear();
+            lenL.clear();
         }
+        public List<Long> pulsesForChecking() {
+            return pulseL;
+        }
+        BufCont bufcont;
+        List<Integer> posL = new ArrayList<>();
+        List<Integer> lenL = new ArrayList<>();
+        List<Long> tsL = new ArrayList<>();
+        List<Long> pulseL = new ArrayList<>();
+        List<Ty> tyL = new ArrayList<>();
     }
 
-    public static MapTsItemVec empty() {
+    public static MapTsItemVec create() {
         return new MapTsItemVec();
     }
 
     public static MapTsItemVec term() {
-        MapTsItemVec ret = empty();
+        MapTsItemVec ret = create();
         ret.term = true;
         return ret;
     }
@@ -52,8 +64,8 @@ public class MapTsItemVec implements Releasable {
     public enum Ty {
         FULL,
         OPEN,
-        CLOSE,
         MIDDLE,
+        CLOSE,
     }
 
     public void bufferBegin(BufCont bufcont) {
@@ -75,12 +87,12 @@ public class MapTsItemVec implements Releasable {
         }
     }
 
-    public void add(int pos, int len, long ts, Ty ty) {
+    public void add(int pos, int len, long ts, long pulse, Ty ty) {
         if (bufCount == 1) {
-            item1.add(pos, len, ts, ty);
+            item1.add(pos, len, ts, pulse, ty);
         }
         else if (bufCount == 2) {
-            item2.add(pos, len, ts, ty);
+            item2.add(pos, len, ts, pulse, ty);
         }
         else {
             throw new RuntimeException("logic");
@@ -124,16 +136,26 @@ public class MapTsItemVec implements Releasable {
     }
 
     public List<BufCont> takeBuffers() {
+        markWith(BufCont.Mark.MtivTB1);
+        if (item1 == null && item2 != null) {
+            LOGGER.error("only item2 present");
+            throw new RuntimeException("logic");
+        }
         List<BufCont> a = new ArrayList<>();
         if (item1 != null) {
             a.add(item1.bufcont);
             item1.bufcont = null;
+            item1.release();
             item1 = null;
         }
         if (item2 != null) {
             a.add(item2.bufcont);
             item2.bufcont = null;
+            item2.release();
             item2 = null;
+        }
+        for (BufCont bc : a) {
+            bc.appendMark(BufCont.Mark.MtivTB2);
         }
         return a;
     }
@@ -182,8 +204,10 @@ public class MapTsItemVec implements Releasable {
                     int i1 = st.g1;
                     // TODO provide origin
                     //String name = String.format("MapTsItemVec-fluxFromItem-%s-%d-of-%d", partname, i1, ib2.posL.size());
-                    MapTsToken tok = new MapTsToken(ib2.bufcont.cloned(BufCont.Mark.ITEM_VEC_VGEN), fid, ib2.posL.get(i1), ib2.lenL.get(i1), ib2.tsL
-                    .get(i1), ib2.tyL.get(i1));
+                    BufCont bc = ib2.bufcont.cloned(BufCont.Mark.ITEM_VEC_VGEN);
+                    bc.bufferRef().writePosition(ib2.posL.get(i1) + ib2.lenL.get(i1));
+                    bc.bufferRef().readPosition(ib2.posL.get(i1));
+                    MapTsToken tok = new MapTsToken(bc, fid, ib2.posL.get(i1), ib2.lenL.get(i1), ib2.tsL.get(i1), ib2.pulseL.get(i1), ib2.tyL.get(i1));
                     st.g1 += 1;
                     sink.next(tok);
                 }
@@ -198,11 +222,12 @@ public class MapTsItemVec implements Releasable {
     }
 
     public Flux<MapTsToken> intoFlux(int fid) {
+        markWith(BufCont.Mark.MtivIFlA);
         Flux<MapTsToken> fl1 = fluxFromItem(fid, item1, "A");
         Flux<MapTsToken> fl2 = fluxFromItem(fid, item2, "B");
         item1 = null;
         item2 = null;
-        return fl1.concatWith(fl2).doOnNext(kk -> kk.appendName(BufCont.Mark.ITEM_VEC_TFL));
+        return fl1.concatWith(fl2).doOnNext(kk -> kk.appendMark(BufCont.Mark.ITEM_VEC_TFL));
     }
 
     public void markWith(BufCont.Mark prefix) {
@@ -267,5 +292,15 @@ public class MapTsItemVec implements Releasable {
             return List.of();
         }
     }
+
+    public String stats() {
+        return String.format("1: %s  2: %s  total token count: %d", item1 != null, item2 != null, tokenCount());
+    }
+
+    // allow access for checking
+    public ItemsBuffer item1;
+    public ItemsBuffer item2;
+    boolean term;
+    int bufCount;
 
 }

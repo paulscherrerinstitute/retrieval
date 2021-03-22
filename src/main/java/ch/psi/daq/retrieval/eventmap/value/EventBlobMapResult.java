@@ -63,7 +63,7 @@ public class EventBlobMapResult implements Releasable {
         release();
     }
 
-    public void appendName(BufCont.Mark mark) {
+    public void appendMark(BufCont.Mark mark) {
         if (bufconts != null) {
             bufconts.forEach(k -> k.appendMark(mark));
         }

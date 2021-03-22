@@ -1,6 +1,6 @@
 package ch.psi.daq.retrieval.error;
 
-import ch.psi.daq.retrieval.ReqCtx;
+import ch.psi.daq.retrieval.reqctx.ReqCtx;
 
 public class RequestException extends RetrievalException {
 

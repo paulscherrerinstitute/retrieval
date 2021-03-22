@@ -1,18 +1,21 @@
 package ch.psi.daq.retrieval.controller;
 
 import ch.psi.daq.retrieval.ChannelLister;
-import ch.psi.daq.retrieval.ReqCtx;
+import ch.psi.daq.retrieval.reqctx.ReqCtx;
 import ch.psi.daq.retrieval.bytes.BufCont;
 import ch.psi.daq.retrieval.config.ConfigurationRetrieval;
 import ch.psi.daq.retrieval.finder.BaseDirFinderFormatV0;
 import ch.psi.daq.retrieval.pod.api1.Query;
 import ch.psi.daq.retrieval.pod.api1.channelsearch.ChannelSearchQuery;
 import ch.psi.daq.retrieval.status.RequestStatus;
+import ch.psi.daq.retrieval.status.RequestStatusBoard;
+import ch.psi.daq.retrieval.subnodes.RawSub;
 import ch.psi.daq.retrieval.throttle.Throttle;
 import ch.qos.logback.classic.Logger;
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.web.context.WebServerInitializedEvent;
 import org.springframework.context.ApplicationListener;
@@ -35,11 +38,15 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
+import javax.annotation.PreDestroy;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.PrintStream;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.ZoneOffset;
@@ -47,21 +54,23 @@ import java.time.ZonedDateTime;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 
 @RestController
-public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent> {
+public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>, DisposableBean {
     static Logger LOGGER = (Logger) LoggerFactory.getLogger(API_1_0_1.class.getSimpleName());
     @Value("${retrieval.configFile:#{null}}") String configFile;
     public QueryData queryData;
+    public RequestStatusBoard rsb;
     public int localPort;
     public ConfigurationRetrieval conf;
     InetAddress localAddress;
     String localAddressString;
     String localHostname;
     String canonicalHostname;
-    static Scheduler dbsched = Schedulers.newParallel("db", 32);
+    static Scheduler dbsched = Schedulers.newBoundedElastic(32, 256, "db");
     {
         try {
             localAddress = InetAddress.getLocalHost();
@@ -94,7 +103,7 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
     @PostMapping(path = "/api/1/query", consumes = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> query(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
         // The default is octets, to stay compatible with older clients
-        ReqCtx reqctx = ReqCtx.fromRequest(exchange);
+        ReqCtx reqctx = ReqCtx.fromRequest(exchange, rsb);
         LOGGER.warn("{}  /query via default endpoint", reqctx);
         if (exchange.getRequest().getHeaders().getAccept().contains(MediaType.APPLICATION_OCTET_STREAM)) {
             LOGGER.warn("{}  started in default endpoint despite having octet-stream set", reqctx);
@@ -102,25 +111,11 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
         return queryProducesOctets(exchange, queryMono);
     }
 
-    // deprecated
-    @PostMapping(path = "/api/1.0.1/query", consumes = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<Flux<DataBuffer>>> api101_query(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        LOGGER.warn("deprecated {}  remote {}", exchange.getRequest().getURI().getPath(), exchange.getRequest().getRemoteAddress());
-        return query(exchange, queryMono);
-    }
-
-    // deprecated
-    @PostMapping(path = "/api/v1/query", consumes = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<Flux<DataBuffer>>> apiv1_query(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        LOGGER.warn("deprecated {}  remote {}", exchange.getRequest().getURI().getPath(), exchange.getRequest().getRemoteAddress());
-        return query(exchange, queryMono);
-    }
-
 
     @PostMapping(path = "/api/1/query", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> queryProducesOctets(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
         totalDataRequests.getAndAdd(1);
-        ReqCtx reqctx = ReqCtx.fromRequest(exchange);
+        ReqCtx reqctx = ReqCtx.fromRequest(exchange, rsb);
         if (conf.mergeLocal) {
             return queryData.queryMergedOctetsLocal(reqctx, queryMono);
         }
@@ -129,56 +124,28 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
         }
     }
 
-    // deprecated
-    @PostMapping(path = "/api/v1/query", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
-    public Mono<ResponseEntity<Flux<DataBuffer>>> apiv1_queryProducesOctets(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        LOGGER.warn("deprecated {}  remote {}", exchange.getRequest().getURI().getPath(), exchange.getRequest().getRemoteAddress());
-        return queryProducesOctets(exchange, queryMono);
-    }
-
-    // deprecated
-    @PostMapping(path = "/api/1.0.1/query", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
-    public Mono<ResponseEntity<Flux<DataBuffer>>> api101_queryProducesOctets(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        LOGGER.warn("deprecated {}  remote {}", exchange.getRequest().getURI().getPath(), exchange.getRequest().getRemoteAddress());
-        return queryProducesOctets(exchange, queryMono);
-    }
-
 
     @PostMapping(path = "/api/1/query", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> queryProducesJson(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
         totalDataRequests.getAndAdd(1);
-        ReqCtx reqctx = ReqCtx.fromRequest(exchange);
+        ReqCtx reqctx = ReqCtx.fromRequest(exchange, rsb);
         if (!exchange.getRequest().getHeaders().getAccept().contains(MediaType.APPLICATION_JSON)) {
-            LOGGER.warn("{}  /query for json without Accept header", reqctx);
+            LOGGER.warn("{}  /query for unpack without Accept header", reqctx);
         }
-        return queryData.queryMergedJson(reqctx, exchange, queryMono);
-    }
-
-    // deprecated
-    @PostMapping(path = "/api/1.0.1/query", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<Flux<DataBuffer>>> api101_queryProducesJson(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        LOGGER.warn("deprecated {}  remote {}", exchange.getRequest().getURI().getPath(), exchange.getRequest().getRemoteAddress());
-        return queryProducesJson(exchange, queryMono);
-    }
-
-    // deprecated
-    @PostMapping(path = "/api/v1/query", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<Flux<DataBuffer>>> apiv1_queryProducesJson(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        LOGGER.warn("deprecated {}  remote {}", exchange.getRequest().getURI().getPath(), exchange.getRequest().getRemoteAddress());
-        return queryProducesJson(exchange, queryMono);
+        return queryData.queryMergedJson(reqctx, queryMono);
     }
 
 
     @PostMapping(path = "/api/1/queryMerged", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> queryMergedOctets(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
         totalDataRequests.getAndAdd(1);
-        return queryData.queryMergedOctets(ReqCtx.fromRequest(exchange), queryMono);
+        return queryData.queryMergedOctets(ReqCtx.fromRequest(exchange, rsb), queryMono);
     }
 
-    @PostMapping(path = "/api/1/queryLocal", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
+    @PostMapping(path = "/api/1/queryNoMerge", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> queryLocal(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
         totalDataRequests.getAndAdd(1);
-        return queryData.queryLocal(ReqCtx.fromRequest(exchange), exchange, queryMono);
+        return queryData.queryNoMerge(ReqCtx.fromRequest(exchange, rsb), exchange, queryMono);
     }
 
     @PostMapping(path = "/api/1/rng", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
@@ -226,24 +193,13 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
     @PostMapping(path = "/api/1/rawLocal", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> rawLocal(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
         totalDataRequests.getAndAdd(1);
-        return queryData.rawLocal(ReqCtx.fromRequest(exchange, false), exchange, queryMono);
+        return queryData.rawLocal(ReqCtx.fromRequest(exchange, false, rsb), exchange, queryMono);
     }
 
     @PostMapping(path = "/api/1/queryMergedLocal", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> queryMergedLocalOctets(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
         totalDataRequests.getAndAdd(1);
-        return queryData.queryMergedOctetsLocal(ReqCtx.fromRequest(exchange), queryMono);
-    }
-
-    @PostMapping(path = "/api/1/queryJson", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<Flux<DataBuffer>>> queryJson(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        return queryMergedJson(exchange, queryMono);
-    }
-
-    @PostMapping(path = "/api/1/queryMergedJson", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<Flux<DataBuffer>>> queryMergedJson(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        totalDataRequests.getAndAdd(1);
-        return queryData.queryMergedJson(ReqCtx.fromRequest(exchange), exchange, queryMono);
+        return queryData.queryMergedOctetsLocal(ReqCtx.fromRequest(exchange, rsb), queryMono);
     }
 
     Flux<DataBuffer> channelsJson(DataBufferFactory bufFac, ChannelSearchQuery q, boolean configOut) {
@@ -254,7 +210,7 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
 
     @GetMapping(path = "/api/1/channels", produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> channelsGet(ServerWebExchange exchange) {
-        ReqCtx reqctx = ReqCtx.fromRequest(exchange);
+        ReqCtx reqctx = ReqCtx.fromRequest(exchange, rsb);
         LOGGER.debug("{}  request for channelsGet", reqctx);
         ChannelSearchQuery q = new ChannelSearchQuery();
         q.ordering = "asc";
@@ -262,7 +218,7 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
         .map(fl -> {
             LOGGER.info("{}  building response entity", reqctx);
             return ResponseEntity.ok()
-            .header("X-CanonicalHostname", canonicalHostname)
+            .header("X-CanonicalHostname", conf.canonicalHostname)
             .contentType(MediaType.APPLICATION_JSON)
             .body(fl);
         });
@@ -270,14 +226,14 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
 
     @GetMapping(path = "/api/1/channels/search/regexp/{regexp}", produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> channelsGet(ServerWebExchange exchange, @PathVariable String regexp) {
-        ReqCtx reqctx = ReqCtx.fromRequest(exchange);
+        ReqCtx reqctx = ReqCtx.fromRequest(exchange, rsb);
         LOGGER.info("{}  request for channelsRegexp  [{}]", reqctx, regexp);
         ChannelSearchQuery q = new ChannelSearchQuery();
         q.ordering = "asc";
         return Mono.just(channelsJson(exchange.getResponse().bufferFactory(), q, false))
         .map(fl -> {
             return ResponseEntity.ok()
-            .header("X-CanonicalHostname", canonicalHostname)
+            .header("X-CanonicalHostname", conf.canonicalHostname)
             .contentType(MediaType.APPLICATION_JSON)
             .body(fl);
         });
@@ -285,7 +241,7 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
 
     @PostMapping(path = "/api/1/channels", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> channelsPost(ServerWebExchange exchange, @RequestBody Mono<ChannelSearchQuery> queryMono) {
-        ReqCtx reqctx = ReqCtx.fromRequest(exchange);
+        ReqCtx reqctx = ReqCtx.fromRequest(exchange, rsb);
         LOGGER.debug("{}  request for channelsPost", reqctx);
         return queryMono.map(query -> {
             if (!query.valid()) {
@@ -296,7 +252,7 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
         })
         .map(fl -> {
             return ResponseEntity.ok()
-            .header("X-CanonicalHostname", canonicalHostname)
+            .header("X-CanonicalHostname", conf.canonicalHostname)
             .contentType(MediaType.APPLICATION_JSON)
             .body(fl);
         });
@@ -304,7 +260,7 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
 
     @PostMapping(path = "/api/1/channels/config", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> channelsConfigPost(ServerWebExchange exchange, @RequestBody Mono<ChannelSearchQuery> queryMono) {
-        ReqCtx reqctx = ReqCtx.fromRequest(exchange);
+        ReqCtx reqctx = ReqCtx.fromRequest(exchange, rsb);
         LOGGER.info("{}  request for channelsPost", reqctx);
         return queryMono.map(query -> {
             if (!query.valid()) {
@@ -315,7 +271,7 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
         })
         .map(fl -> {
             return ResponseEntity.ok()
-            .header("X-CanonicalHostname", canonicalHostname)
+            .header("X-CanonicalHostname", conf.canonicalHostname)
             .contentType(MediaType.APPLICATION_JSON)
             .body(fl);
         });
@@ -331,30 +287,15 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
         return String.format("len %d  %s", params.size(), params.toString());
     }
 
-    public static void logHeaders(ServerWebExchange ex) {
+    public static void logHeaders(ReqCtx reqCtx, ServerWebExchange ex) {
         for (String n : List.of("User-Agent", "X-PythonDataAPIPackageVersion", "X-PythonDataAPIModule")) {
-            LOGGER.info("{}  header {} {}", ReqCtx.fromRequest(ex), n, ex.getRequest().getHeaders().get(n));
+            LOGGER.info("{}  header {} {}", reqCtx, n, ex.getRequest().getHeaders().get(n));
         }
     }
 
     @GetMapping(path = "/api/1/requestStatus/{reqid}", produces = MediaType.APPLICATION_JSON_VALUE)
     public RequestStatus requestStatus(ServerWebExchange ex, @PathVariable String reqid) {
-        LOGGER.debug("{}  requestStatus  reqid {}", ReqCtx.fromRequest(ex), reqid);
         return queryData.requestStatusBoard().get(reqid);
-    }
-
-    // deprecated
-    @GetMapping(path = "/api/1.0.1/requestStatus/{reqid}", produces = MediaType.APPLICATION_JSON_VALUE)
-    public RequestStatus api101_requestStatus(ServerWebExchange ex, @PathVariable String reqid) {
-        LOGGER.warn("deprecated {}  remote {}", ex.getRequest().getURI().getPath(), ex.getRequest().getRemoteAddress());
-        return requestStatus(ex, reqid);
-    }
-
-    // deprecated
-    @GetMapping(path = "/api/v1/requestStatus/{reqid}", produces = MediaType.APPLICATION_JSON_VALUE)
-    public RequestStatus apiv1_requestStatus(ServerWebExchange ex, @PathVariable String reqid) {
-        LOGGER.warn("deprecated {}  remote {}", ex.getRequest().getURI().getPath(), ex.getRequest().getRemoteAddress());
-        return requestStatus(ex, reqid);
     }
 
 
@@ -385,8 +326,22 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
         }
     }
 
+    @PreDestroy
+    public void preDestroy() {
+        LOGGER.info("preDestroy");
+        shuttingDown.set(1);
+    }
+
+    @Override
+    public void destroy() {
+        LOGGER.info("destroy");
+        shuttingDown.set(1);
+    }
+
     @Override
     public void onApplicationEvent(WebServerInitializedEvent ev) {
+        LOGGER.warn("test warn level log output");
+        LOGGER.error("test error level log output");
         localPort = ev.getWebServer().getPort();
         try {
             ConfigurationRetrieval c = loadConfiguration(ev);
@@ -399,17 +354,28 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
         catch (IOException e) {
             throw new RuntimeException(e);
         }
+        Hooks.onOperatorDebug();
         Hooks.onNextDropped(obj -> QueryData.doDiscard("hooks_api1_0", obj));
-        Hooks.onNextDropped(obj -> QueryData.doDiscard("hooks_api1_1", obj));
         Hooks.onOperatorError((err, obj) -> {
-            LOGGER.error("Hooks.onOperatorError  {}  {}", err, obj);
             QueryData.doDiscard("Hooks.onOperatorError", obj);
+            ByteArrayOutputStream ba = new ByteArrayOutputStream();
+            PrintStream ps = new PrintStream(ba);
+            err.printStackTrace(ps);
+            if (obj instanceof BufCont) {
+                BufCont bc = (BufCont) obj;
+                ps.format("BufCont Marks %s", bc.marksToString());
+            }
+            ps.close();
+            LOGGER.error("Hooks.onOperatorError  {}  {}\n{}", err, obj, ba.toString(StandardCharsets.UTF_8));
             return err;
         });
         LOGGER.info("canonicalHostname {}  localPort {}  databufferBaseDir {}  databufferKeyspacePrefix {}", conf.canonicalHostname, localPort, conf.databufferBaseDir, conf.databufferKeyspacePrefix);
         queryData = new QueryData(new BaseDirFinderFormatV0(Path.of(conf.databufferBaseDir), conf.databufferKeyspacePrefix), conf);
         queryData.port = localPort;
+        rsb = queryData.requestStatusBoard();
         new RawSub(queryData).rawTcp();
     }
+
+    public final AtomicInteger shuttingDown = new AtomicInteger();
 
 }

@@ -4,10 +4,6 @@ import java.util.List;
 
 public class Node {
 
-    public String host;
-    public int port;
-    public List<Integer> splits;
-
     public Node(String host, int port, List<Integer> splits) {
         this.host = host;
         this.port = port;
@@ -20,5 +16,14 @@ public class Node {
     }
 
     public Node() {}
+
+    @Override
+    public String toString() {
+        return String.format("%s:%d", host, port);
+    }
+
+    public String host;
+    public int port;
+    public List<Integer> splits;
 
 }
