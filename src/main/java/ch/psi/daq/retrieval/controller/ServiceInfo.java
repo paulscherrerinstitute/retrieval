@@ -354,11 +354,16 @@ public class ServiceInfo {
         .flatMap(i1 -> {
             return WebClient.create()
             .get().uri("http://localhost:8331/api/1/stats/version")
-            .exchange()
-            .filter(k -> k.statusCode() == HttpStatus.OK)
-            .flatMapMany(k -> k.bodyToFlux(DataBuffer.class))
-            .map(DataBuffer::readableByteCount)
-            .reduce(0L, Long::sum);
+            .exchangeToMono(res -> {
+                if (res.statusCode() == HttpStatus.OK) {
+                    return res.bodyToFlux(DataBuffer.class)
+                    .map(DataBuffer::readableByteCount)
+                    .reduce(0L, Long::sum);
+                }
+                else {
+                    return Mono.error(new RuntimeException("fail"));
+                }
+            });
         })
         .reduce(0L, Long::sum)
         .map(k -> String.format("leaked: %d  %d  %d\n", l1.size(), totalBytes.get(), k));
