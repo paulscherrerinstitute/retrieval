@@ -136,36 +136,6 @@ public class QueryData {
         return requestStatusBoard;
     }
 
-    public Mono<ResponseEntity<Flux<DataBuffer>>> queryNoMerge(ReqCtx reqCtx, ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        ServerHttpRequest req = exchange.getRequest();
-        Mono<Flux<DataBuffer>> mret = queryMono
-        .doOnError(x -> LOGGER.info("can not parse request"))
-        .map(query -> {
-            QueryParams qp = QueryParams.fromQuery(conf, query, reqCtx.bufCtx);
-            LOGGER.info(String.format("queryLocal  %s  %s  %s  %s", req.getId(), qp.begin, qp.end, qp.channels));
-            long endNanos = 1000000L * qp.end.toEpochMilli();
-            List<Integer> splits = conf.splits.stream()
-            .filter(split -> qp.splits == null || qp.splits.isEmpty() || qp.splits.contains(split))
-            .collect(Collectors.toList());
-            if (splits.size() != 1) {
-                LOGGER.error("{}  queryNoMerge  can only handle a single split  splits {}", reqCtx, splits);
-                throw new RuntimeException("logic");
-            }
-            int split = splits.get(0);
-            return Flux.fromIterable(qp.channels)
-            .concatMap(channel -> {
-                return ChannelEventStream.channelDataFluxes(reqCtx, qp, baseDirFinder, qp.begin, qp.end, Duration.ZERO, channel.name, split)
-                .flatMapMany(res -> EventBlobToV1Map.trans(reqCtx, res.fl, channel.name, endNanos, reqCtx.bufCtx, qp))
-                .transform(doDiscard("queryLocalEnd"))
-                .concatMapIterable(EventBlobMapResult::takeBufCont, 4)
-                .map(BufCont::takeBuf)
-                .filter(Optional::isPresent)
-                .map(Optional::get);
-            });
-        });
-        return logResponse(reqCtx, "queryLocal", mret);
-    }
-
     public Mono<ResponseEntity<Flux<DataBuffer>>> queryMergedOctetsLocal(ReqCtx reqCtx, Mono<Query> queryMono) {
         return new MergedOctetsLocal().queryMergedOctetsLocal(reqCtx, this, queryMono);
     }

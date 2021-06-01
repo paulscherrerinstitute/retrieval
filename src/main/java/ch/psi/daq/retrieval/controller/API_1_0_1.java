@@ -142,12 +142,6 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
         return queryData.queryMergedOctets(ReqCtx.fromRequest(exchange, rsb), queryMono);
     }
 
-    @PostMapping(path = "/api/1/queryNoMerge", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
-    public Mono<ResponseEntity<Flux<DataBuffer>>> queryLocal(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        totalDataRequests.getAndAdd(1);
-        return queryData.queryNoMerge(ReqCtx.fromRequest(exchange, rsb), exchange, queryMono);
-    }
-
     @PostMapping(path = "/api/1/rng", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
     public Mono<ResponseEntity<Flux<DataBuffer>>> rng(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
         final int N = 64 * 1024;
@@ -194,12 +188,6 @@ public class API_1_0_1 implements ApplicationListener<WebServerInitializedEvent>
     public Mono<ResponseEntity<Flux<DataBuffer>>> rawLocal(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
         totalDataRequests.getAndAdd(1);
         return queryData.rawLocal(ReqCtx.fromRequest(exchange, false, rsb), exchange, queryMono);
-    }
-
-    @PostMapping(path = "/api/1/queryMergedLocal", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
-    public Mono<ResponseEntity<Flux<DataBuffer>>> queryMergedLocalOctets(ServerWebExchange exchange, @RequestBody Mono<Query> queryMono) {
-        totalDataRequests.getAndAdd(1);
-        return queryData.queryMergedOctetsLocal(ReqCtx.fromRequest(exchange, rsb), queryMono);
     }
 
     Flux<DataBuffer> channelsJson(DataBufferFactory bufFac, ChannelSearchQuery q, boolean configOut) {
